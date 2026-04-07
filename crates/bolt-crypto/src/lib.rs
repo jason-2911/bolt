@@ -1,10 +1,6 @@
-//! Bolt security layer: Noise_XX_25519_ChaChaPoly_BLAKE2s handshake,
-//! key management, and client authentication.
+//! Bolt security layer: key management, TLS certificate generation,
+//! and QUIC endpoint configuration.
 
 pub mod auth;
 pub mod keys;
-pub mod noise;
-
-pub use auth::*;
-pub use keys::*;
-pub use noise::*;
+pub mod tls;
