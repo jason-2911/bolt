@@ -1,69 +1,170 @@
 //! boltd — Bolt protocol server daemon.
+//!
+//! Configuration file: /etc/bolt/boltd.toml (or ~/.bolt/boltd.toml)
+//!
+//! ```toml
+//! listen = "0.0.0.0:2222"
+//! max_connections = 1000
+//! max_per_ip = 10
+//! rate_limit_burst = 20
+//! rate_limit_window_secs = 60
+//! host_key = "/etc/bolt/host_key"
+//! cert = "/etc/bolt/host_cert.der"
+//! authorized_keys = "/etc/bolt/authorized_keys"
+//! log_format = "text"
+//! ```
 
 use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::Parser;
+use serde::Deserialize;
 use tokio::signal;
 use tracing::info;
 
-use bolt_log::{init as log_init, Config as LogConfig, Format, parse_format};
+use bolt_log::{init as log_init, parse_format, Config as LogConfig};
 use bolt_server::{Server, ServerConfig};
 
-const VERSION: &str = concat!("boltd ", env!("CARGO_PKG_VERSION"));
+// ── CLI ───────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "boltd", about = "Bolt — Lightning-fast secure remote shell daemon")]
+#[command(
+    name = "boltd",
+    about = "Bolt — Lightning-fast secure remote shell daemon",
+    version
+)]
 struct Args {
+    /// Config file path
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// Listen address (host:port)
-    #[arg(long, default_value = "0.0.0.0:2222")]
-    listen: String,
+    #[arg(long)]
+    listen: Option<String>,
 
     /// Path to host private key
-    #[arg(long, default_value = "/etc/bolt/host_key")]
-    host_key: PathBuf,
+    #[arg(long)]
+    host_key: Option<PathBuf>,
+
+    /// Path to TLS certificate (auto-generated if missing)
+    #[arg(long)]
+    cert: Option<PathBuf>,
 
     /// Path to authorized keys file
-    #[arg(long = "authorized-keys", default_value = "/etc/bolt/authorized_keys")]
-    auth_keys: PathBuf,
+    #[arg(long = "authorized-keys")]
+    auth_keys: Option<PathBuf>,
 
     /// Maximum concurrent connections
-    #[arg(long, default_value_t = 1000)]
-    max_connections: usize,
+    #[arg(long)]
+    max_connections: Option<usize>,
+
+    /// Max simultaneous connections per IP
+    #[arg(long)]
+    max_per_ip: Option<usize>,
 
     /// Log format: "text" or "json"
-    #[arg(long = "log-format", default_value = "text")]
-    log_format: String,
+    #[arg(long = "log-format")]
+    log_format: Option<String>,
 
     /// Verbose logging (debug level)
     #[arg(short = 'v', long)]
     verbose: bool,
-
-    /// Print version and exit
-    #[arg(long)]
-    version: bool,
 }
+
+// ── Config file ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct FileConfig {
+    listen: Option<String>,
+    max_connections: Option<usize>,
+    max_per_ip: Option<usize>,
+    rate_limit_burst: Option<usize>,
+    rate_limit_window_secs: Option<u64>,
+    host_key: Option<String>,
+    cert: Option<String>,
+    authorized_keys: Option<String>,
+    log_format: Option<String>,
+}
+
+impl FileConfig {
+    fn load(path: &std::path::Path) -> Self {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => return Self::default(),
+        };
+        toml::from_str(&text).unwrap_or_else(|e| {
+            eprintln!("boltd: warning: {} parse error: {e}", path.display());
+            Self::default()
+        })
+    }
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    if args.version {
-        println!("{VERSION}");
-        return Ok(());
-    }
+    // Load config file
+    let file_cfg = {
+        let config_path = args.config.clone().or_else(|| {
+            // Search order: /etc/bolt/boltd.toml, ~/.bolt/boltd.toml
+            let etc = std::path::Path::new("/etc/bolt/boltd.toml");
+            if etc.exists() {
+                return Some(etc.to_path_buf());
+            }
+            dirs::home_dir().map(|h| h.join(".bolt/boltd.toml"))
+        });
+        config_path
+            .as_deref()
+            .map(FileConfig::load)
+            .unwrap_or_default()
+    };
+
+    // Merge: CLI > config file > defaults
+    let log_format_str = args.log_format
+        .as_deref()
+        .or(file_cfg.log_format.as_deref())
+        .unwrap_or("text");
 
     log_init(LogConfig {
-        level:  if args.verbose { tracing::Level::DEBUG } else { tracing::Level::INFO },
-        format: parse_format(&args.log_format),
+        level: if args.verbose {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        },
+        format: parse_format(log_format_str),
     });
 
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+
     let config = ServerConfig {
-        listen_addr:     args.listen,
-        host_key_path:   args.host_key,
-        auth_keys_path:  args.auth_keys,
-        max_connections: args.max_connections,
-        ..Default::default()
+        listen_addr: args.listen
+            .or(file_cfg.listen)
+            .unwrap_or_else(|| "0.0.0.0:2222".into()),
+
+        host_key_path: args.host_key
+            .or_else(|| file_cfg.host_key.map(PathBuf::from))
+            .unwrap_or_else(|| home.join(".bolt/host_key")),
+
+        cert_path: args.cert
+            .or_else(|| file_cfg.cert.map(PathBuf::from))
+            .unwrap_or_else(|| home.join(".bolt/host_cert.der")),
+
+        auth_keys_path: args.auth_keys
+            .or_else(|| file_cfg.authorized_keys.map(PathBuf::from))
+            .unwrap_or_else(|| home.join(".bolt/authorized_keys")),
+
+        max_connections: args.max_connections
+            .or(file_cfg.max_connections)
+            .unwrap_or(1000),
+
+        max_per_ip: args.max_per_ip
+            .or(file_cfg.max_per_ip)
+            .unwrap_or(10),
+
+        rate_limit_window_secs: file_cfg.rate_limit_window_secs.unwrap_or(60),
+        rate_limit_burst: file_cfg.rate_limit_burst.unwrap_or(20),
     };
 
     let server = Server::new(config).context("init server")?;
@@ -71,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         res = server.listen_and_serve() => res?,
         _ = signal::ctrl_c() => {
-            info!(component = "server", "shutting down (SIGINT)");
+            info!("shutting down (SIGINT)");
         }
     }
 
