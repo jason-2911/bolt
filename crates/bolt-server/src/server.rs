@@ -27,6 +27,8 @@ pub struct ServerConfig {
     pub host_key_path: PathBuf,
     pub cert_path: PathBuf,
     pub auth_keys_path: PathBuf,
+    /// Optional path to trusted CA public keys (enables cert auth).
+    pub ca_keys_path: Option<PathBuf>,
     pub max_connections: usize,
     /// Max simultaneous connections per client IP.
     pub max_per_ip: usize,
@@ -42,6 +44,7 @@ impl Default for ServerConfig {
             host_key_path: PathBuf::from("/etc/bolt/host_key"),
             cert_path: PathBuf::from("/etc/bolt/host_cert.der"),
             auth_keys_path: PathBuf::from("/etc/bolt/authorized_keys"),
+            ca_keys_path: None,
             max_connections: 1000,
             max_per_ip: 10,
             rate_limit_window_secs: 60,
@@ -56,6 +59,8 @@ pub struct Server {
     config: ServerConfig,
     host_key: KeyPair,
     auth: Option<Arc<Authenticator>>,
+    /// Trusted CA public keys for certificate auth.
+    ca_keys: Arc<Vec<[u8; 32]>>,
 }
 
 impl Server {
@@ -76,10 +81,27 @@ impl Server {
             }
         };
 
+        // Load CA keys if configured
+        let ca_keys = if let Some(ref ca_path) = config.ca_keys_path {
+            match bolt_crypto::ca::load_ca_keys(ca_path) {
+                Ok(keys) => {
+                    info!(path = %ca_path.display(), count = keys.len(), "CA keys loaded");
+                    keys
+                }
+                Err(e) => {
+                    warn!(error = %e, "CA keys not loaded");
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        };
+
         Ok(Self {
             config,
             host_key,
             auth,
+            ca_keys: Arc::new(ca_keys),
         })
     }
 
@@ -130,13 +152,14 @@ impl Server {
             };
 
             let auth = self.auth.clone();
+            let ca_keys = Arc::clone(&self.ca_keys);
             let limiter2 = Arc::clone(&limiter);
 
             tokio::spawn(async move {
                 let remote = incoming.remote_address();
                 match incoming.await {
                     Ok(conn) => {
-                        if let Err(e) = handle_connection(conn, auth).await {
+                        if let Err(e) = handle_connection(conn, auth, ca_keys).await {
                             error!(remote = %remote, error = %e, "connection error");
                         }
                     }

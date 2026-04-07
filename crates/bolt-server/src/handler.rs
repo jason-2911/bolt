@@ -10,8 +10,11 @@ use bolt_crypto::auth::Authenticator;
 use bolt_proto::{read_msg, write_msg, ChannelType, Message};
 
 use crate::{
+    agent::handle_agent_forward,
     exec::handle_exec,
     forward::handle_forward,
+    fs::handle_fs,
+    remote_forward::handle_remote_forward,
     shell::handle_shell,
     transfer::handle_transfer,
 };
@@ -22,6 +25,7 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 pub async fn handle_connection(
     conn: Connection,
     auth: Option<Arc<Authenticator>>,
+    ca_keys: Arc<Vec<[u8; 32]>>,
 ) -> anyhow::Result<()> {
     let remote = conn.remote_address();
     let remote_ip = remote.ip();
@@ -62,6 +66,22 @@ pub async fn handle_connection(
             }
             info!(remote = %remote, user = %user, method = "password", "authenticated");
             (user, [0u8; 32])
+        }
+        Message::AuthCert { cert } => {
+            // Certificate auth — verify against trusted CA keys
+            match auth_cert(&cert, &ca_keys) {
+                Ok(user) => {
+                    info!(remote = %remote, user = %user, method = "cert", "authenticated");
+                    (user, [0u8; 32])
+                }
+                Err(e) => {
+                    warn!(remote = %remote, error = %e, "cert auth failed");
+                    write_msg(&mut auth_send, &Message::AuthFailure { reason: e.to_string() })
+                        .await.ok();
+                    auth_send.finish().ok();
+                    return Ok(());
+                }
+            }
         }
         other => {
             write_msg(
@@ -120,8 +140,9 @@ pub async fn handle_connection(
 
         let remote_addr = remote;
         let user = client_user.clone();
+        let conn2 = conn.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(send, recv, &user).await {
+            if let Err(e) = handle_stream(conn2, send, recv, &user).await {
                 warn!(remote = %remote_addr, error = %e, "stream error");
             }
         });
@@ -154,6 +175,7 @@ async fn send_keepalive(conn: &Connection) -> anyhow::Result<()> {
 // ── Stream dispatch ───────────────────────────────────────────────────────
 
 async fn handle_stream(
+    conn: Connection,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     user: &str,
@@ -195,7 +217,28 @@ async fn handle_stream(
         ChannelType::Exec => handle_exec(&mut send, &mut recv, &command, user).await,
         ChannelType::Scp => handle_transfer(&mut send, &mut recv, &command).await,
         ChannelType::PortForward => handle_forward(&mut send, &mut recv, &command).await,
+        ChannelType::RemoteForward => {
+            // command = "port" (the port the server should bind)
+            handle_remote_forward(&mut send, &mut recv, &command, &conn).await
+        }
+        ChannelType::Fs => handle_fs(&mut send, &mut recv, user).await,
+        ChannelType::AgentForward => handle_agent_forward(&mut send, &mut recv).await,
     }
+}
+
+// ── Certificate verification ──────────────────────────────────────────────
+
+/// Verify a BoltCert against the server's trusted CA keys.
+fn auth_cert(cert_bytes: &[u8], ca_keys: &[[u8; 32]]) -> anyhow::Result<String> {
+    use bolt_crypto::ca::BoltCert;
+
+    if ca_keys.is_empty() {
+        anyhow::bail!("certificate auth not configured (no CA keys loaded)");
+    }
+
+    let cert = BoltCert::from_bytes(cert_bytes)?;
+    cert.verify(&cert.username, ca_keys)?;
+    Ok(cert.username.clone())
 }
 
 // ── Password verification ─────────────────────────────────────────────────
