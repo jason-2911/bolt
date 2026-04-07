@@ -1,52 +1,53 @@
 //! Client remote command execution.
 
 use anyhow::Context as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
-use bolt_proto::channel::{ChannelOpenMsg, ChannelType, ExitStatusMsg, MsgType, RequestType};
-use bolt_session::{Session, PRIORITY_HIGH};
+use bolt_proto::{read_msg, write_msg, ChannelType, Message};
+
+use crate::client::Session;
 
 /// Execute `command` on the remote end. Returns the exit code.
 pub async fn exec(session: &Session, command: &str) -> anyhow::Result<i32> {
-    let mut stream = session.open_stream(PRIORITY_HIGH)?;
+    let (mut send, mut recv) = session.open_bi().await?;
 
     // Open exec channel
-    let open = ChannelOpenMsg {
-        channel_type: ChannelType::Exec,
-        command:      command.to_owned(),
-    };
-    stream.write_all(&open.marshal()).await?;
+    write_msg(
+        &mut send,
+        &Message::ChannelOpen {
+            channel_type: ChannelType::Exec,
+            command: command.to_owned(),
+        },
+    )
+    .await?;
 
-    // Wait for confirm
-    let mut hdr = [0u8; 1];
-    stream.read_exact(&mut hdr).await?;
-    if hdr[0] != MsgType::ChannelOpenConfirm as u8 {
-        anyhow::bail!("exec channel rejected");
+    // Wait for accept
+    let Some(msg) = read_msg(&mut recv).await? else {
+        anyhow::bail!("connection closed before channel accept");
+    };
+    match msg {
+        Message::ChannelAccept => {}
+        Message::ChannelReject { reason } => anyhow::bail!("exec rejected: {reason}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
     }
 
     let mut stdout = tokio::io::stdout();
     let mut exit_code = 0i32;
-    let mut buf = vec![0u8; 4096];
 
     loop {
-        let n = stream.read(&mut buf).await.context("read exec output")?;
-        if n == 0 { break; }
-
-        let data = &buf[..n];
-        match data[0] {
-            b if b == MsgType::ChannelData as u8 && n > 5 => {
-                stdout.write_all(&data[5..n]).await?;
+        let Some(msg) = read_msg(&mut recv).await.context("read exec output")? else {
+            break;
+        };
+        match msg {
+            Message::Data(data) => {
+                stdout.write_all(&data).await?;
                 stdout.flush().await?;
             }
-            b if b == MsgType::ChannelRequest as u8
-                && n >= 2
-                && data[1] == RequestType::ExitStatus as u8 =>
-            {
-                if let Ok(msg) = ExitStatusMsg::unmarshal(data) {
-                    exit_code = msg.exit_code as i32;
-                }
+            Message::ExitStatus { code } => {
+                exit_code = code;
                 break;
             }
+            Message::Eof => break,
             _ => {}
         }
     }

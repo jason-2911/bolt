@@ -6,7 +6,7 @@
 //!   - JSON and human-readable text output
 
 use tracing::Level;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::EnvFilter;
 
 /// Logger output format.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
