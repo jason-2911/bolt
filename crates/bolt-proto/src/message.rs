@@ -11,18 +11,21 @@ pub const MAX_MSG_SIZE: u32 = 16 * 1024 * 1024;
 
 // ── Message enum ──────────────────────────────────────────────────────────
 
-/// Every message exchanged over a QUIC stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
-    // ── Auth (control stream) ──
+    // ── Auth ──
     AuthRequest {
         user: String,
         public_key: [u8; 32],
     },
-    /// Password auth fallback when no keypair available.
+    /// Password auth fallback.
     AuthPassword {
         user: String,
         password: String,
+    },
+    /// CA-signed certificate auth.
+    AuthCert {
+        cert: Vec<u8>,
     },
     AuthSuccess,
     AuthFailure { reason: String },
@@ -40,26 +43,11 @@ pub enum Message {
     Eof,
 
     // ── Shell / PTY ──
-    /// Send before PtyRequest to forward environment variables.
-    EnvSet {
-        key: String,
-        val: String,
-    },
-    PtyRequest {
-        term: String,
-        cols: u32,
-        rows: u32,
-    },
-    WindowChange {
-        cols: u32,
-        rows: u32,
-    },
-    Signal {
-        name: String,
-    },
-    ExitStatus {
-        code: i32,
-    },
+    EnvSet { key: String, val: String },
+    PtyRequest { term: String, cols: u32, rows: u32 },
+    WindowChange { cols: u32, rows: u32 },
+    Signal { name: String },
+    ExitStatus { code: i32 },
 
     // ── Keepalive ──
     Ping,
@@ -70,74 +58,68 @@ pub enum Message {
         name: String,
         size: u64,
         mode: u32,
-        /// Unix mtime (seconds since epoch). 0 = not preserved.
         mtime: u64,
-        /// Whether FileChunk payloads are zstd-compressed.
         compress: bool,
     },
     FileChunk(Vec<u8>),
-    FileEnd {
-        sha256: [u8; 32],
-    },
+    FileEnd { sha256: [u8; 32] },
     FileAck,
-    FileFail {
-        reason: String,
-    },
+    FileFail { reason: String },
 
     // ── Transfer resume ──
-    /// Client asks: "I want to resume upload at this path; how many bytes do you have?"
-    ResumeRequest {
-        path: String,
-    },
-    /// Server replies with how many bytes it has already (0 = start fresh).
-    ResumeOffset {
-        offset: u64,
-    },
+    ResumeRequest { path: String },
+    ResumeOffset { offset: u64 },
 
-    // ── Delta sync (rsync-style) ──
-    /// Client asks server: "do you have this file? I want to sync it"
-    SyncRequest {
-        name: String,
-        size: u64,
-        mode: u32,
-    },
-    /// Server responds with rsync signature of existing file
-    SyncSignature {
-        signature: Vec<u8>,
-    },
-    /// Server says file doesn't exist — client should send full
+    // ── Delta sync ──
+    SyncRequest { name: String, size: u64, mode: u32 },
+    SyncSignature { signature: Vec<u8> },
     SyncNotFound,
-    /// Client sends computed delta (only the diff)
-    SyncDelta {
-        delta: Vec<u8>,
-    },
-    /// Server says files are identical, no transfer needed
+    SyncDelta { delta: Vec<u8> },
     SyncUpToDate,
 
     // ── Directory listing ──
-    /// Client requests directory listing from server.
-    DirList {
-        path: String,
-    },
-    /// Server sends one entry per file/dir.
-    DirEntry {
+    DirList { path: String },
+    DirEntry { name: String, is_dir: bool, size: u64, mtime: u64, mode: u32 },
+    DirEnd,
+
+    // ── Local port forwarding ──
+    ForwardOpen { host: String, port: u16 },
+    ForwardAccept,
+    ForwardReject { reason: String },
+
+    // ── Remote port forwarding (-R) ──
+    /// Client asks server to bind a TCP port; "0" = pick any free port.
+    RemoteForwardBind { bind_port: u16 },
+    /// Server confirms and tells client which port was actually bound.
+    RemoteForwardBound { bound_port: u16 },
+    /// Server notifies client of a new incoming connection on the bound port.
+    RemoteForwardIncoming { peer: String },
+    /// Server (or client) signals no more remote forward connections.
+    RemoteForwardClose,
+
+    // ── Filesystem (SFTP-like) ──
+    FsRename { from: String, to: String },
+    FsRemove { path: String, recursive: bool },
+    FsMkdir  { path: String, mode: u32 },
+    FsChmod  { path: String, mode: u32 },
+    FsStat   { path: String },
+    FsStatResult {
         name: String,
-        is_dir: bool,
         size: u64,
         mtime: u64,
         mode: u32,
+        is_dir: bool,
+        is_symlink: bool,
     },
-    /// Server signals end of directory listing.
-    DirEnd,
+    FsOk,
+    FsFail { reason: String },
 
-    // ── Port forwarding ──
-    /// Open forward channel: command = "host:port"
-    ForwardOpen {
-        host: String,
-        port: u16,
-    },
-    ForwardAccept,
-    ForwardReject { reason: String },
+    // ── SSH agent forwarding ──
+    /// Client requests that the server create a forwarded agent socket.
+    AgentForwardRequest,
+    AgentForwardAccept,
+    /// Raw SSH agent protocol message (length-prefixed, direction: client→server or server→client).
+    AgentMessage { data: Vec<u8> },
 }
 
 /// Channel types.
@@ -147,22 +129,27 @@ pub enum ChannelType {
     Exec,
     Scp,
     PortForward,
+    RemoteForward,
+    Fs,
+    AgentForward,
 }
 
 impl std::fmt::Display for ChannelType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Shell => write!(f, "shell"),
-            Self::Exec => write!(f, "exec"),
-            Self::Scp => write!(f, "scp"),
-            Self::PortForward => write!(f, "port-forward"),
+            Self::Shell         => write!(f, "shell"),
+            Self::Exec          => write!(f, "exec"),
+            Self::Scp           => write!(f, "scp"),
+            Self::PortForward   => write!(f, "port-forward"),
+            Self::RemoteForward => write!(f, "remote-forward"),
+            Self::Fs            => write!(f, "fs"),
+            Self::AgentForward  => write!(f, "agent-forward"),
         }
     }
 }
 
-// ── Encode / Decode (sync) ────────────────────────────────────────────────
+// ── Encode / Decode ───────────────────────────────────────────────────────
 
-/// Encode a message into a length-prefixed frame: `[u32 BE len][bincode payload]`.
 pub fn encode(msg: &Message) -> Result<Vec<u8>, ProtoError> {
     let payload = bincode::serialize(msg).map_err(ProtoError::Encode)?;
     let len = payload.len() as u32;
@@ -175,25 +162,16 @@ pub fn encode(msg: &Message) -> Result<Vec<u8>, ProtoError> {
     Ok(buf)
 }
 
-/// Decode a message from a bincode payload (without the length prefix).
 pub fn decode(payload: &[u8]) -> Result<Message, ProtoError> {
     bincode::deserialize(payload).map_err(ProtoError::Decode)
 }
 
-// ── Async framed read / write ─────────────────────────────────────────────
-
-/// Write a length-prefixed bincode message to an async writer.
-pub async fn write_msg<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    msg: &Message,
-) -> Result<(), ProtoError> {
+pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> Result<(), ProtoError> {
     let frame = encode(msg)?;
     w.write_all(&frame).await?;
     Ok(())
 }
 
-/// Read a length-prefixed bincode message from an async reader.
-/// Returns `None` on clean EOF.
 pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Message>, ProtoError> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf).await {
@@ -201,12 +179,10 @@ pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Message>
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     }
-
     let len = u32::from_be_bytes(len_buf);
     if len > MAX_MSG_SIZE {
         return Err(ProtoError::MessageTooLarge(len));
     }
-
     let mut payload = vec![0u8; len as usize];
     r.read_exact(&mut payload).await?;
     let msg = bincode::deserialize(&payload).map_err(ProtoError::Decode)?;
