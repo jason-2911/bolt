@@ -3,8 +3,6 @@ resolver = "2"
 members = [
     "crates/bolt-proto",
     "crates/bolt-crypto",
-    "crates/bolt-transport",
-    "crates/bolt-session",
     "crates/bolt-log",
     "crates/bolt-server",
     "crates/bolt-client",
@@ -20,32 +18,39 @@ license     = "MIT"
 
 [workspace.dependencies]
 # Internal crates
-bolt-proto     = { path = "crates/bolt-proto" }
-bolt-crypto    = { path = "crates/bolt-crypto" }
-bolt-transport = { path = "crates/bolt-transport" }
-bolt-session   = { path = "crates/bolt-session" }
-bolt-log       = { path = "crates/bolt-log" }
-bolt-server    = { path = "crates/bolt-server" }
-bolt-client    = { path = "crates/bolt-client" }
+bolt-proto  = { path = "crates/bolt-proto" }
+bolt-crypto = { path = "crates/bolt-crypto" }
+bolt-log    = { path = "crates/bolt-log" }
+bolt-server = { path = "crates/bolt-server" }
+bolt-client = { path = "crates/bolt-client" }
 
 # Async runtime
-tokio          = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+
+# QUIC transport
+quinn   = "0.11"
+rustls  = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen   = "0.13"
+
+# Serialization
+serde   = { version = "1", features = ["derive"] }
+bincode = "1"
 
 # Error handling
-thiserror = "1"
+thiserror = "2"
 anyhow    = "1"
 
 # Logging / tracing
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
-# Crypto
-snow        = "0.9"          # Noise Protocol Framework
+# Crypto / keys
+snow         = "0.9"
 x25519-dalek = "2"
-sha2        = "0.10"
-rand        = "0.8"
-base64      = "0.22"
-zeroize     = "1"
+sha2         = "0.10"
+rand         = "0.8"
+base64       = "0.22"
+zeroize      = "1"
 
 # Bytes / IO
 bytes = "1"
@@ -53,8 +58,26 @@ bytes = "1"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Progress bar
+indicatif = "0.17"
+
 # Unix / PTY
 nix = { version = "0.28", features = ["ioctl", "signal", "term", "process", "fs"] }
 
+# Rsync delta sync
+fast_rsync = "0.2"
+
 # Filesystem
 walkdir = "2"
+
+# Config file
+toml = "0.8"
+
+# Home directory
+dirs = "5"
+
+# Shell completion
+clap_complete = "4"
+
+# Compression
+zstd = "0.13"

@@ -10,9 +10,11 @@ path = "src/main.rs"
 [dependencies]
 bolt-log    = { workspace = true }
 bolt-server = { workspace = true }
-bolt-crypto = { workspace = true }
 
 tokio   = { workspace = true }
 anyhow  = { workspace = true }
 tracing = { workspace = true }
-clap    = { workspace = true }
+clap  = { workspace = true }
+toml  = { workspace = true }
+dirs  = { workspace = true }
+serde = { workspace = true }
