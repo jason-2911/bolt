@@ -1,9 +1,13 @@
 //! Bolt client library.
 
+pub mod agent;
 pub mod client;
 pub mod config;
+pub mod control;
 pub mod exec;
 pub mod forward;
+pub mod fs;
+pub mod remote_forward;
 pub mod shell;
 pub mod terminal;
 pub mod transfer;

@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 
 use bolt_crypto::{
     keys::{KeyPair, KnownHosts},
+    session_store::FileSessionStore,
     tls,
 };
 use bolt_proto::Message;
@@ -154,7 +155,11 @@ impl Client {
     async fn connect_direct(&self, addr: &str, user: &str) -> anyhow::Result<Session> {
         let remote: SocketAddr = addr.parse().with_context(|| format!("parse address: {addr}"))?;
 
-        let client_config = tls::client_config().context("build TLS client config")?;
+        // Use file-backed session store for 0-RTT resumption
+        let session_cache_path = dirs_home().join(".bolt/session_cache");
+        let store = FileSessionStore::load(session_cache_path);
+        let client_config = tls::client_config_with_resume(store)
+            .context("build TLS client config")?;
 
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
             .context("bind client endpoint")?;
