@@ -40,12 +40,29 @@ pub fn server_config(
 /// Build a quinn `ClientConfig` that skips CA verification.
 /// We verify via known_hosts fingerprint at the application layer (SSH model).
 pub fn client_config() -> Result<quinn::ClientConfig, TlsError> {
+    client_config_inner(None)
+}
+
+/// Build a quinn `ClientConfig` with a file-backed session store for 0-RTT.
+pub fn client_config_with_resume(
+    session_store: Arc<dyn rustls::client::ClientSessionStore>,
+) -> Result<quinn::ClientConfig, TlsError> {
+    client_config_inner(Some(session_store))
+}
+
+fn client_config_inner(
+    session_store: Option<Arc<dyn rustls::client::ClientSessionStore>>,
+) -> Result<quinn::ClientConfig, TlsError> {
     let mut tls_config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
     tls_config.alpn_protocols = vec![b"bolt/1".to_vec()];
+
+    if let Some(store) = session_store {
+        tls_config.resumption = rustls::client::Resumption::store(store);
+    }
 
     let quic_config =
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)

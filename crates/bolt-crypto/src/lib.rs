@@ -2,5 +2,7 @@
 //! and QUIC endpoint configuration.
 
 pub mod auth;
+pub mod ca;
 pub mod keys;
+pub mod session_store;
 pub mod tls;
