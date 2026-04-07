@@ -17,7 +17,10 @@ const UDP_SEND_PAYLOAD_BUDGET: usize = 900;
 /// Returns the bounding box of changed pixels between two frames, or `None` if
 /// the frames are identical.  Returns the full frame rect when there is no
 /// previous frame or when the dimensions changed.
-pub(super) fn detect_dirty_rect(prev: Option<&CapturedFrame>, curr: &CapturedFrame) -> Option<Rect> {
+pub(super) fn detect_dirty_rect(
+    prev: Option<&CapturedFrame>,
+    curr: &CapturedFrame,
+) -> Option<Rect> {
     if prev.is_none() {
         return Some(Rect {
             x: 0,

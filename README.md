@@ -121,7 +121,7 @@ boltd gui --listen 0.0.0.0:5600 --source window
 bolt gui --listen 0.0.0.0:5601 --server <SERVER_IP>:5600
 ```
 
-**How it works:** Video frames (server → client) and input events (client → server) travel over separate UDP streams, decoupled from the QUIC control channel. The client shows a window picker; press `Enter` to attach, `F6` to detach, `F7`/`F8` to cycle windows.
+**How it works:** Video frames (server → client) and input events (client → server) travel over separate UDP streams, decoupled from the QUIC control channel. The client auto-attaches newly discovered app windows such as `code`; if you need to choose manually, use the window picker with `Enter` to attach, `F6` to detach, and `F7`/`F8` to cycle windows.
 
 Platform notes:
 - **Linux/X11** — `boltd` must run inside an X11 session (`DISPLAY` set). Input is injected via `libXtst` XTest. Requires `libX11` + `libXtst` at link time.

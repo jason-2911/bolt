@@ -1,7 +1,7 @@
 //! minifb window rendering, framebuffer management, and user input forwarding.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{Arc, Mutex},
     thread,
@@ -13,7 +13,7 @@ use minifb::{
     Key, KeyRepeat, MouseButton as FbMouseButton, MouseMode, Scale, Window, WindowOptions,
 };
 use tokio::net::UdpSocket;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use bolt_proto::{
     encode_udp_packet, DesktopInventoryChunk, DesktopWindow, InputEvent, MouseButton, Rect,
@@ -38,6 +38,7 @@ pub struct RenderState {
     inventory_generation: u64,
     pub(super) selected_index: usize,
     pub(super) attached_window_id: Option<u64>,
+    pending_auto_attach_window_id: Option<u64>,
     last_log: Instant,
     last_inventory_log: Instant,
     frames_rendered: u64,
@@ -57,6 +58,7 @@ impl RenderState {
             inventory_generation: 0,
             selected_index: 0,
             attached_window_id: None,
+            pending_auto_attach_window_id: None,
             last_log: Instant::now(),
             last_inventory_log: Instant::now() - Duration::from_secs(10),
             frames_rendered: 0,
@@ -121,6 +123,11 @@ impl RenderState {
     }
 
     fn apply_inventory(&mut self, assembled: CompletedInventory) {
+        let previous_window_ids: HashSet<u64> = self
+            .inventory
+            .iter()
+            .map(|window| window.window_id)
+            .collect();
         let previous_selected = self.selected_window_id();
         self.inventory_generation = assembled.generation;
         self.inventory = assembled.windows;
@@ -146,6 +153,31 @@ impl RenderState {
             }
         } else if self.selected_index >= self.inventory.len() {
             self.selected_index = self.inventory.len().saturating_sub(1);
+        }
+
+        if self.attached_window_id.is_none() {
+            if let Some(window_id) =
+                preferred_auto_attach_window(&self.inventory, &previous_window_ids)
+            {
+                self.pending_auto_attach_window_id = Some(window_id);
+                if let Some(index) = self
+                    .inventory
+                    .iter()
+                    .position(|window| window.window_id == window_id)
+                {
+                    self.selected_index = index;
+                }
+                if let Some(window) = self.inventory.get(self.selected_index) {
+                    info!(
+                        window_id,
+                        process = %window.process_name,
+                        title = %window.title,
+                        "auto-selecting new GUI window"
+                    );
+                }
+            }
+        } else {
+            self.pending_auto_attach_window_id = None;
         }
 
         if self.last_inventory_log.elapsed() >= Duration::from_secs(1) {
@@ -204,6 +236,10 @@ impl RenderState {
         self.inventory
             .get(self.selected_index)
             .map(|window| window.window_id)
+    }
+
+    pub fn take_pending_auto_attach(&mut self) -> Option<u64> {
+        self.pending_auto_attach_window_id.take()
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -298,6 +334,7 @@ pub fn run_window_loop(
 
     loop {
         let attached_mode;
+        let auto_attach_window_id;
         {
             let mut guard = state.lock().map_err(|_| anyhow!("render state poisoned"))?;
             let should_show_window = (guard.surface_w > 0 && guard.surface_h > 0)
@@ -356,11 +393,21 @@ pub fn run_window_loop(
 
             guard.last_window_w = window.get_size().0 as u32;
             guard.last_window_h = window.get_size().1 as u32;
+            auto_attach_window_id = if guard.attached_window_id.is_none() {
+                guard.take_pending_auto_attach()
+            } else {
+                None
+            };
         }
 
         let Some(window) = window.as_mut() else {
             continue;
         };
+        if let Some(window_id) = auto_attach_window_id {
+            info!(window_id, "auto-attaching GUI window");
+            send_input_event(&socket, server, UdpGuiPacket::AttachWindow { window_id });
+            continue;
+        }
         if attached_mode {
             if handle_attached_shortcuts(&state, &socket, server, window)? {
                 last_mouse = None;
@@ -470,7 +517,7 @@ pub fn run_window_loop(
 // ── Input helpers ─────────────────────────────────────────────────────────────
 
 fn send_input_event(socket: &Arc<UdpSocket>, server: SocketAddr, packet: UdpGuiPacket) {
-    use tracing::warn;
+    debug!(packet = %packet_kind(&packet), server = %server, "queue GUI packet");
     let wire = match encode_udp_packet(&packet) {
         Ok(w) => w,
         Err(e) => {
@@ -481,6 +528,63 @@ fn send_input_event(socket: &Arc<UdpSocket>, server: SocketAddr, packet: UdpGuiP
     if let Err(e) = socket.try_send_to(&wire, server) {
         warn!(error = %e, "send input event failed");
     }
+}
+
+fn packet_kind(packet: &UdpGuiPacket) -> &'static str {
+    match packet {
+        UdpGuiPacket::Hello { .. } => "hello",
+        UdpGuiPacket::AttachWindow { .. } => "attach_window",
+        UdpGuiPacket::DetachWindow => "detach_window",
+        UdpGuiPacket::InputEvent(_) => "input_event",
+        UdpGuiPacket::VideoChunk(_) => "video_chunk",
+        UdpGuiPacket::DesktopInventoryChunk(_) => "desktop_inventory_chunk",
+    }
+}
+
+fn preferred_auto_attach_window(
+    inventory: &[DesktopWindow],
+    previous_window_ids: &HashSet<u64>,
+) -> Option<u64> {
+    let new_windows: Vec<&DesktopWindow> = inventory
+        .iter()
+        .filter(|window| !previous_window_ids.contains(&window.window_id))
+        .collect();
+    if new_windows.is_empty() {
+        return None;
+    }
+
+    new_windows
+        .iter()
+        .rev()
+        .find(|window| !is_terminal_like_process(&window.process_name))
+        .copied()
+        .or_else(|| {
+            (previous_window_ids.is_empty() && new_windows.len() == 1)
+                .then(|| new_windows.last().copied())
+                .flatten()
+        })
+        .map(|window| window.window_id)
+}
+
+fn is_terminal_like_process(process_name: &str) -> bool {
+    matches!(
+        process_name.trim().to_ascii_lowercase().as_str(),
+        "xterm"
+            | "gnome-terminal"
+            | "gnome-terminal-server"
+            | "konsole"
+            | "alacritty"
+            | "kitty"
+            | "wezterm-gui"
+            | "wezterm"
+            | "terminal"
+            | "tmux"
+            | "screen"
+            | "bash"
+            | "sh"
+            | "zsh"
+            | "fish"
+    )
 }
 
 fn key_to_code(k: Key) -> u32 {
@@ -560,7 +664,19 @@ fn handle_selector_shortcuts(
     }
     if window.is_key_pressed(Key::Enter, KeyRepeat::No) {
         if let Some(window_id) = guard.selected_window_id() {
+            if let Some(selected) = guard.inventory.get(guard.selected_index) {
+                info!(
+                    window_id,
+                    process = %selected.process_name,
+                    title = %selected.title,
+                    "selector attach requested"
+                );
+            } else {
+                info!(window_id, "selector attach requested");
+            }
             send_input_event(socket, server, UdpGuiPacket::AttachWindow { window_id });
+        } else {
+            warn!("selector attach requested, but inventory is empty");
         }
     }
 
@@ -578,7 +694,15 @@ fn render_inventory_screen(
 ) {
     clear_u32(screen, 0x10161d);
     fill_rect(screen, width, height, 0, 0, width, 72, 0x172333);
-    draw_text_with_shadow(screen, width, height, text, (20, 14), "Bolt Desktop Agent", 0xf6f8fb);
+    draw_text_with_shadow(
+        screen,
+        width,
+        height,
+        text,
+        (20, 14),
+        "Bolt Desktop Agent",
+        0xf6f8fb,
+    );
     draw_text_with_shadow(
         screen,
         width,
@@ -589,14 +713,26 @@ fn render_inventory_screen(
         0x9fb3c8,
     );
 
-    let status = if state.attached_window_id.is_some() { "Attached" } else { "Browsing" };
+    let status = if state.attached_window_id.is_some() {
+        "Attached"
+    } else {
+        "Browsing"
+    };
     let inventory_label = format!(
         "{} windows={} generation={}",
         status,
         state.inventory.len(),
         state.inventory_generation
     );
-    draw_text_with_shadow(screen, width, height, text, (20, 54), &inventory_label, 0x7ad7a8);
+    draw_text_with_shadow(
+        screen,
+        width,
+        height,
+        text,
+        (20, 54),
+        &inventory_label,
+        0x7ad7a8,
+    );
 
     if state.inventory.is_empty() {
         draw_text_with_shadow(
@@ -657,7 +793,13 @@ fn render_inventory_screen(
             background,
         );
 
-        let prefix = if is_attached { "*" } else if is_selected { ">" } else { " " };
+        let prefix = if is_attached {
+            "*"
+        } else if is_selected {
+            ">"
+        } else {
+            " "
+        };
         let pid = window
             .pid
             .map(|pid| pid.to_string())
@@ -741,7 +883,11 @@ fn truncate_text(text: &str, limit: usize) -> String {
         }
         out.push(if ch.is_control() { ' ' } else { ch });
     }
-    if out.is_empty() { "-".to_string() } else { out }
+    if out.is_empty() {
+        "-".to_string()
+    } else {
+        out
+    }
 }
 
 fn checksum32(bytes: &[u8]) -> u32 {

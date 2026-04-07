@@ -1,11 +1,11 @@
 //! GUI streaming server: UDP video+input forwarding with desktop window inventory.
 
+mod demo;
+mod encode;
 #[cfg(target_os = "linux")]
 pub(super) mod linux;
 #[cfg(target_os = "macos")]
 pub(super) mod macos;
-mod demo;
-mod encode;
 
 use std::{
     net::SocketAddr,
@@ -332,12 +332,14 @@ async fn input_receive_loop(
                 let mut guard = target.write().await;
                 if let Some(client) = guard.as_mut() {
                     client.attached_window_id = Some(window_id);
+                    info!(peer = %client.peer, window_id, "GUI attach window");
                 }
             }
             UdpGuiPacket::DetachWindow => {
                 let mut guard = target.write().await;
                 if let Some(client) = guard.as_mut() {
                     client.attached_window_id = None;
+                    info!(peer = %client.peer, "GUI detach window");
                 }
             }
             UdpGuiPacket::InputEvent(ev) => {

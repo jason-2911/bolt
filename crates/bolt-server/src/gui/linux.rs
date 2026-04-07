@@ -238,7 +238,11 @@ fn inject_linux_event(
 }
 
 fn bool_to_x11(value: bool) -> c_int {
-    if value { TRUE } else { FALSE }
+    if value {
+        TRUE
+    } else {
+        FALSE
+    }
 }
 
 // ── Window inventory helpers ──────────────────────────────────────────────────

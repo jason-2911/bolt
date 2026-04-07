@@ -3,16 +3,16 @@
 mod bitmap_text;
 mod render;
 
-use std::{net::SocketAddr, sync::{Arc, Mutex}};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{anyhow, Context as _};
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
-use bolt_proto::{
-    decode_udp_packet, encode_udp_packet, UdpGuiPacket,
-    MAX_UDP_PACKET_SIZE,
-};
+use bolt_proto::{decode_udp_packet, encode_udp_packet, UdpGuiPacket, MAX_UDP_PACKET_SIZE};
 
 pub use render::RenderState;
 
