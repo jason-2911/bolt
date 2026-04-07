@@ -1,281 +1,591 @@
-//! Client file transfer: upload and download with SHA256 + progress bar.
-//!
-//! SCP frames: [type(1)][payload_len(4 BE)][payload(N)]
+//! Client file transfer: rsync delta sync, resume, zstd compression, timestamp preservation.
 
 use std::{
-    io::Write as _,
     path::Path,
-    time::Instant,
+    time::UNIX_EPOCH,
 };
 
-use anyhow::Context as _;
+use anyhow::{bail, Context as _};
+use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
-use tokio::{
-    fs,
-    io::{AsyncReadExt, AsyncWriteExt},
-};
+use tokio::fs;
 
-use bolt_proto::channel::{ChannelOpenMsg, ChannelType, MsgType};
-use bolt_session::{Session, Stream, PRIORITY_HIGH};
+use bolt_proto::{read_msg, write_msg, ChannelType, Message};
+
+use crate::client::Session;
 
 const CHUNK: usize = 32 * 1024;
 
-// ── Upload ─────────────────────────────────────────────────────────────────
+// ── Upload (with delta sync) ──────────────────────────────────────────────
 
 pub async fn upload(session: &Session, local: &Path, remote: &str) -> anyhow::Result<()> {
-    let mut f = fs::File::open(local)
-        .await
-        .with_context(|| format!("open {}", local.display()))?;
-    let meta = f.metadata().await.context("stat")?;
+    upload_opts(session, local, remote, false).await
+}
 
-    let mut stream = session.open_stream(PRIORITY_HIGH)?;
-    open_scp_channel(
-        &mut stream,
-        &format!(
-            "upload {} {:o} {}",
-            meta.len(),
-            meta.permissions().mode(),
-            remote
-        ),
+/// `preserve` = keep mtime.
+pub async fn upload_opts(
+    session: &Session,
+    local: &Path,
+    remote: &str,
+    preserve: bool,
+) -> anyhow::Result<()> {
+    let local_data = fs::read(local)
+        .await
+        .with_context(|| format!("read {}", local.display()))?;
+
+    let meta = fs::metadata(local).await.context("stat")?;
+    let mode = get_file_mode(&meta);
+    let file_size = local_data.len() as u64;
+    let mtime = if preserve {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let (mut send, mut recv) = session.open_bi().await?;
+
+    write_msg(
+        &mut send,
+        &Message::ChannelOpen {
+            channel_type: ChannelType::Scp,
+            command: String::new(),
+        },
+    )
+    .await?;
+    expect_accept(&mut recv).await?;
+
+    write_msg(
+        &mut send,
+        &Message::SyncRequest {
+            name: remote.to_owned(),
+            size: file_size,
+            mode,
+        },
     )
     .await?;
 
-    // Wait for server ready
-    recv_frame_type(&mut stream, MsgType::ChannelSuccess)
-        .await
-        .context("server not ready")?;
-
-    let label = format!("⬆ {}", local.file_name().unwrap_or_default().to_string_lossy());
-    let mut hasher = Sha256::new();
-    let mut buf    = vec![0u8; CHUNK];
-    let mut sent   = 0u64;
-    let start      = Instant::now();
-
-    loop {
-        let n = f.read(&mut buf).await.context("read file")?;
-        if n == 0 { break; }
-        let chunk = &buf[..n];
-        send_frame(&mut stream, MsgType::ChannelData, chunk).await?;
-        hasher.update(chunk);
-        sent += n as u64;
-        render_progress(&label, sent, meta.len(), start);
-    }
-
-    // EOF frame carries SHA256
-    let sum = hasher.finalize();
-    send_frame(&mut stream, MsgType::ChannelEof, &sum).await?;
-    finish_progress(&label, sent, start);
-
-    // Wait for server ACK
-    recv_frame_type(&mut stream, MsgType::ChannelSuccess)
-        .await
-        .context("upload failed")?;
-
-    Ok(())
-}
-
-// ── Download ───────────────────────────────────────────────────────────────
-
-pub async fn download(session: &Session, remote: &str, local: &Path) -> anyhow::Result<()> {
-    let mut stream = session.open_stream(PRIORITY_HIGH)?;
-    open_scp_channel(&mut stream, &format!("download {}", remote)).await?;
-
-    // Read OK frame — server appends 8-byte file size
-    let (_, size_payload) = read_frame(&mut stream).await?;
-    if size_payload.len() < 8 {
-        anyhow::bail!("missing file size in server response");
-    }
-    let file_size = u64::from_be_bytes(size_payload[..8].try_into().unwrap());
-
-    // Resolve output path
-    let out_path = if local.to_str() == Some(".") || local.to_string_lossy().ends_with('/') {
-        local.join(Path::new(remote).file_name().unwrap_or_default())
-    } else {
-        local.to_path_buf()
+    let Some(msg) = read_msg(&mut recv).await? else {
+        bail!("connection closed during sync handshake");
     };
 
+    let file_name = local
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+
+    match msg {
+        Message::SyncSignature { signature } => {
+            upload_delta(&mut send, &mut recv, &local_data, &signature, &file_name).await
+        }
+        Message::SyncNotFound => {
+            upload_full(&mut send, &mut recv, &local_data, &file_name, file_size, mtime).await
+        }
+        Message::FileFail { reason } => bail!("server error: {reason}"),
+        other => bail!("unexpected sync response: {other:?}"),
+    }
+}
+
+/// Send only the delta (rsync diff).
+async fn upload_delta(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    local_data: &[u8],
+    signature_bytes: &[u8],
+    file_name: &str,
+) -> anyhow::Result<()> {
+    let signature = fast_rsync::Signature::deserialize(signature_bytes.to_vec())
+        .context("deserialize server signature")?;
+    let indexed = signature.index();
+
+    let mut delta = Vec::new();
+    fast_rsync::diff(&indexed, local_data, &mut delta).context("compute delta")?;
+
+    if delta.is_empty() {
+        eprintln!("{file_name}: up to date");
+        return Ok(());
+    }
+
+    let delta_size = delta.len() as u64;
+    let full_size = local_data.len() as u64;
+    let saved_pct = if full_size > 0 {
+        100.0 - (delta_size as f64 / full_size as f64 * 100.0)
+    } else {
+        0.0
+    };
+
+    let pb = make_progress_bar(&format!("delta {file_name}"), delta_size);
+
+    let mut offset = 0;
+    while offset < delta.len() {
+        let end = (offset + CHUNK).min(delta.len());
+        let chunk = &delta[offset..end];
+        write_msg(send, &Message::SyncDelta { delta: chunk.to_vec() }).await?;
+        pb.inc(chunk.len() as u64);
+        offset = end;
+    }
+
+    let sha256: [u8; 32] = Sha256::digest(local_data).into();
+    write_msg(send, &Message::FileEnd { sha256 }).await?;
+    pb.finish_with_message(format!("done (saved {saved_pct:.0}%)"));
+
+    expect_ack(recv).await
+}
+
+/// Send full file. Optionally resume from `start_offset`.
+async fn upload_full(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    local_data: &[u8],
+    file_name: &str,
+    file_size: u64,
+    mtime: u64,
+) -> anyhow::Result<()> {
+    // Use zstd for large files
+    let compress = local_data.len() > 4096;
+
+    // Send FileHeader with metadata
+    write_msg(
+        send,
+        &Message::FileHeader {
+            name: file_name.to_owned(),
+            size: file_size,
+            mode: 0o644,
+            mtime,
+            compress,
+        },
+    )
+    .await?;
+
+    let pb = make_progress_bar(&format!("upload {file_name}"), file_size);
+    let mut hasher = Sha256::new();
+
+    let mut offset = 0;
+    while offset < local_data.len() {
+        let end = (offset + CHUNK).min(local_data.len());
+        let chunk = &local_data[offset..end];
+        hasher.update(chunk);
+
+        let payload = if compress {
+            zstd::encode_all(chunk, 3).context("compress chunk")?
+        } else {
+            chunk.to_vec()
+        };
+
+        write_msg(send, &Message::FileChunk(payload)).await?;
+        pb.inc(chunk.len() as u64);
+        offset = end;
+    }
+
+    let sha256: [u8; 32] = hasher.finalize().into();
+    write_msg(send, &Message::FileEnd { sha256 }).await?;
+    pb.finish_with_message(if compress { "done (compressed)" } else { "done (full)" });
+
+    expect_ack(recv).await
+}
+
+// ── Upload with resume ────────────────────────────────────────────────────
+
+/// Upload a large file with resume support (skips already-uploaded bytes).
+pub async fn upload_resume(
+    session: &Session,
+    local: &Path,
+    remote: &str,
+) -> anyhow::Result<()> {
+    let local_data = fs::read(local)
+        .await
+        .with_context(|| format!("read {}", local.display()))?;
+
+    let (mut send, mut recv) = session.open_bi().await?;
+
+    write_msg(
+        &mut send,
+        &Message::ChannelOpen {
+            channel_type: ChannelType::Scp,
+            command: String::new(),
+        },
+    )
+    .await?;
+    expect_accept(&mut recv).await?;
+
+    // Ask server how many bytes it already has
+    write_msg(&mut send, &Message::ResumeRequest { path: remote.to_owned() }).await?;
+    let offset = match read_msg(&mut recv).await? {
+        Some(Message::ResumeOffset { offset }) => offset as usize,
+        _ => 0,
+    };
+
+    if offset >= local_data.len() {
+        eprintln!("{}: already complete", local.display());
+        return Ok(());
+    }
+
+    let remaining = &local_data[offset..];
+    let file_name = local.file_name().unwrap_or_default().to_string_lossy();
+
+    if offset > 0 {
+        eprintln!("{file_name}: resuming from byte {offset}");
+    }
+
+    let compress = remaining.len() > 4096;
+    write_msg(
+        &mut send,
+        &Message::FileHeader {
+            name: remote.to_owned(),
+            size: local_data.len() as u64,
+            mode: 0o644,
+            mtime: 0,
+            compress,
+        },
+    )
+    .await?;
+
+    let pb = make_progress_bar(&format!("upload {file_name}"), remaining.len() as u64);
+
+    // Hash the whole original file (server will reconstruct)
+    let mut hasher = Sha256::new();
+    hasher.update(&local_data[..]);
+
+    let mut pos = 0;
+    while pos < remaining.len() {
+        let end = (pos + CHUNK).min(remaining.len());
+        let chunk = &remaining[pos..end];
+
+        let payload = if compress {
+            zstd::encode_all(chunk, 3).context("compress chunk")?
+        } else {
+            chunk.to_vec()
+        };
+
+        write_msg(&mut send, &Message::FileChunk(payload)).await?;
+        pb.inc(chunk.len() as u64);
+        pos = end;
+    }
+
+    let sha256: [u8; 32] = hasher.finalize().into();
+    write_msg(&mut send, &Message::FileEnd { sha256 }).await?;
+    pb.finish_with_message("done (resumed)");
+
+    expect_ack(&mut recv).await
+}
+
+// ── Download ──────────────────────────────────────────────────────────────
+
+pub async fn download(session: &Session, remote: &str, local: &Path) -> anyhow::Result<()> {
+    download_opts(session, remote, local, false).await
+}
+
+pub async fn download_opts(
+    session: &Session,
+    remote: &str,
+    local: &Path,
+    preserve: bool,
+) -> anyhow::Result<()> {
+    let (mut send, mut recv) = session.open_bi().await?;
+
+    write_msg(
+        &mut send,
+        &Message::ChannelOpen {
+            channel_type: ChannelType::Scp,
+            command: format!("download {remote}"),
+        },
+    )
+    .await?;
+    expect_accept(&mut recv).await?;
+
+    let local_data = if local.exists() && local.is_file() {
+        fs::read(local).await.ok()
+    } else {
+        None
+    };
+
+    if let Some(ref data) = local_data {
+        let sig = compute_signature(data);
+        write_msg(&mut send, &Message::SyncSignature { signature: sig }).await?;
+    } else {
+        write_msg(&mut send, &Message::SyncNotFound).await?;
+    }
+
+    let Some(msg) = read_msg(&mut recv).await? else {
+        bail!("connection closed during download");
+    };
+
+    let out_path = resolve_download_path(local, remote);
+
+    match msg {
+        Message::FileHeader { name, size, mtime, compress, .. } => {
+            download_full(&mut send, &mut recv, &out_path, &name, size, mtime, compress, preserve).await
+        }
+        Message::SyncDelta { delta } => {
+            let ld = local_data.context("local file disappeared")?;
+            download_delta(&mut send, &mut recv, &out_path, &ld, delta, remote, preserve).await
+        }
+        Message::SyncUpToDate => {
+            eprintln!(
+                "{}: up to date",
+                Path::new(remote).file_name().unwrap_or_default().to_string_lossy()
+            );
+            Ok(())
+        }
+        Message::FileFail { reason } => bail!("server error: {reason}"),
+        other => bail!("unexpected download response: {other:?}"),
+    }
+}
+
+async fn download_full(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    out_path: &Path,
+    file_name: &str,
+    file_size: u64,
+    mtime: u64,
+    compress: bool,
+    preserve: bool,
+) -> anyhow::Result<()> {
+    let display_name = Path::new(file_name)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+
     let tmp_path = format!("{}.bolt-tmp", out_path.display());
-    let mut out  = fs::OpenOptions::new()
-        .write(true).create(true).truncate(true)
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
         .open(&tmp_path)
         .await
         .context("create output file")?;
 
-    let label    = format!("⬇ {}", Path::new(remote).file_name().unwrap_or_default().to_string_lossy());
-    let mut hasher   = Sha256::new();
-    let mut received = 0u64;
-    let start        = Instant::now();
+    let pb = make_progress_bar(&format!("download {display_name}"), file_size);
+    let mut hasher = Sha256::new();
 
     loop {
-        let (msg_type, payload) = read_frame(&mut stream).await?;
-        match msg_type {
-            t if t == MsgType::ChannelData as u8 => {
-                out.write_all(&payload).await.context("write file")?;
-                hasher.update(&payload);
-                received += payload.len() as u64;
-                render_progress(&label, received, file_size, start);
+        let Some(msg) = read_msg(recv).await? else {
+            bail!("connection closed during transfer");
+        };
+        match msg {
+            Message::FileChunk(data) => {
+                let data = if compress {
+                    zstd::decode_all(data.as_slice()).context("decompress chunk")?
+                } else {
+                    data
+                };
+                tokio::io::AsyncWriteExt::write_all(&mut out, &data).await.context("write")?;
+                hasher.update(&data);
+                pb.inc(data.len() as u64);
             }
-            t if t == MsgType::ChannelEof as u8 => {
-                if payload.len() != 32 {
-                    anyhow::bail!("invalid checksum length {}", payload.len());
-                }
-                out.flush().await?;
+            Message::FileEnd { sha256 } => {
+                tokio::io::AsyncWriteExt::flush(&mut out).await?;
                 drop(out);
-                finish_progress(&label, received, start);
+                pb.finish_with_message("done");
 
-                let sum = hasher.finalize();
-                if sum.as_slice() != payload.as_slice() {
+                let computed: [u8; 32] = hasher.finalize().into();
+                if computed != sha256 {
                     fs::remove_file(&tmp_path).await.ok();
-                    anyhow::bail!("checksum mismatch — file corrupted");
+                    bail!("checksum mismatch");
                 }
 
-                fs::rename(&tmp_path, &out_path).await.context("rename")?;
+                fs::rename(&tmp_path, out_path).await.context("rename")?;
 
-                // ACK the server
-                send_frame(&mut stream, MsgType::ChannelSuccess, &[]).await.ok();
+                if preserve && mtime > 0 {
+                    set_mtime(out_path, mtime);
+                }
+
+                write_msg(send, &Message::FileAck).await.ok();
                 return Ok(());
             }
             other => {
                 fs::remove_file(&tmp_path).await.ok();
-                anyhow::bail!("unexpected frame 0x{:02x}", other);
+                bail!("unexpected: {other:?}");
             }
         }
     }
 }
 
-// ── SCP channel helpers ────────────────────────────────────────────────────
+async fn download_delta(
+    _send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    out_path: &Path,
+    local_data: &[u8],
+    first_delta: Vec<u8>,
+    remote: &str,
+    preserve: bool,
+) -> anyhow::Result<()> {
+    let display_name = Path::new(remote)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
 
-async fn open_scp_channel(stream: &mut Stream, command: &str) -> anyhow::Result<()> {
-    let open = ChannelOpenMsg {
-        channel_type: ChannelType::Scp,
-        command:      command.to_owned(),
-    };
-    stream.write_all(&open.marshal()).await.context("send channel open")
-}
+    let mut full_delta = first_delta;
 
-async fn send_frame(stream: &mut Stream, msg_type: MsgType, payload: &[u8]) -> anyhow::Result<()> {
-    let mut buf = Vec::with_capacity(5 + payload.len());
-    buf.push(msg_type as u8);
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(payload);
-    stream.write_all(&buf).await.context("send frame")
-}
+    loop {
+        let Some(msg) = read_msg(recv).await? else {
+            bail!("connection closed during delta transfer");
+        };
+        match msg {
+            Message::SyncDelta { delta } => {
+                full_delta.extend_from_slice(&delta);
+            }
+            Message::FileEnd { sha256 } => {
+                let mut result = Vec::new();
+                fast_rsync::apply(local_data, &full_delta, &mut result)
+                    .context("apply delta")?;
 
-async fn recv_frame_type(stream: &mut Stream, expected: MsgType) -> anyhow::Result<Vec<u8>> {
-    let (got, payload) = read_frame(stream).await?;
-    if got != expected as u8 {
-        anyhow::bail!("expected frame 0x{:02x}, got 0x{:02x}", expected as u8, got);
+                let computed: [u8; 32] = Sha256::digest(&result).into();
+                if computed != sha256 {
+                    bail!("checksum mismatch after delta apply");
+                }
+
+                fs::write(out_path, &result).await.context("write")?;
+                let saved_pct = if !result.is_empty() {
+                    100.0 - (full_delta.len() as f64 / result.len() as f64 * 100.0)
+                } else {
+                    0.0
+                };
+                eprintln!("{display_name}: synced (saved {saved_pct:.0}%)");
+                let _ = preserve; // mtime comes with SyncDelta — not preserved in delta mode
+                return Ok(());
+            }
+            other => bail!("unexpected: {other:?}"),
+        }
     }
-    Ok(payload)
 }
 
-async fn read_frame(stream: &mut Stream) -> anyhow::Result<(u8, Vec<u8>)> {
-    let mut hdr = [0u8; 5];
-    stream.read_exact(&mut hdr).await.context("read frame header")?;
-    let msg_type    = hdr[0];
-    let payload_len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
-    let payload = if payload_len > 0 {
-        let mut p = vec![0u8; payload_len];
-        stream.read_exact(&mut p).await.context("read frame payload")?;
-        p
-    } else {
-        vec![]
+// ── Directory listing ─────────────────────────────────────────────────────
+
+/// Remote directory entry returned from `list_dir`.
+pub struct RemoteDirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: u64,
+    pub mode: u32,
+}
+
+/// List a remote directory. Returns entries in server-order.
+pub async fn list_dir(session: &Session, remote_path: &str) -> anyhow::Result<Vec<RemoteDirEntry>> {
+    let (mut send, mut recv) = session.open_bi().await?;
+
+    write_msg(
+        &mut send,
+        &Message::ChannelOpen {
+            channel_type: ChannelType::Scp,
+            command: String::new(),
+        },
+    )
+    .await?;
+    expect_accept(&mut recv).await?;
+
+    write_msg(&mut send, &Message::DirList { path: remote_path.to_owned() }).await?;
+
+    let mut entries = Vec::new();
+    loop {
+        let Some(msg) = read_msg(&mut recv).await? else {
+            bail!("connection closed during dir list");
+        };
+        match msg {
+            Message::DirEntry { name, is_dir, size, mtime, mode } => {
+                entries.push(RemoteDirEntry { name, is_dir, size, mtime, mode });
+            }
+            Message::DirEnd => break,
+            Message::FileFail { reason } => bail!("dir list error: {reason}"),
+            other => bail!("unexpected dir list message: {other:?}"),
+        }
+    }
+
+    Ok(entries)
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+fn compute_signature(data: &[u8]) -> Vec<u8> {
+    let sig = fast_rsync::Signature::calculate(
+        data,
+        fast_rsync::SignatureOptions {
+            block_size: 4096,
+            crypto_hash_size: 8,
+        },
+    );
+    sig.serialized().to_vec()
+}
+
+async fn expect_accept(recv: &mut quinn::RecvStream) -> anyhow::Result<()> {
+    let Some(msg) = read_msg(recv).await? else {
+        bail!("connection closed, expected ChannelAccept");
     };
-    Ok((msg_type, payload))
+    match msg {
+        Message::ChannelAccept => Ok(()),
+        Message::ChannelReject { reason } => bail!("rejected: {reason}"),
+        other => bail!("expected ChannelAccept, got {other:?}"),
+    }
 }
 
-// ── Progress rendering ─────────────────────────────────────────────────────
+async fn expect_ack(recv: &mut quinn::RecvStream) -> anyhow::Result<()> {
+    let Some(msg) = read_msg(recv).await? else {
+        bail!("connection closed, expected FileAck");
+    };
+    match msg {
+        Message::FileAck | Message::SyncUpToDate => Ok(()),
+        Message::FileFail { reason } => bail!("transfer failed: {reason}"),
+        other => bail!("expected FileAck, got {other:?}"),
+    }
+}
 
-use std::sync::atomic::{AtomicU64, Ordering};
-static LAST_RENDER_NS: AtomicU64 = AtomicU64::new(0);
+fn resolve_download_path(local: &Path, remote: &str) -> std::path::PathBuf {
+    if local.to_str() == Some(".") || local.to_string_lossy().ends_with('/') {
+        local.join(Path::new(remote).file_name().unwrap_or_default())
+    } else {
+        local.to_path_buf()
+    }
+}
 
-fn render_progress(label: &str, done: u64, total: u64, start: Instant) {
-    let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
-    let last   = LAST_RENDER_NS.load(Ordering::Relaxed);
-    if now_ns.saturating_sub(last) < 100_000_000 { return; } // 100 ms throttle
-    LAST_RENDER_NS.store(now_ns, Ordering::Relaxed);
+fn get_file_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode()
+    }
+    #[cfg(not(unix))]
+    {
+        0o644
+    }
+}
 
-    let elapsed = start.elapsed().as_secs_f64();
-    let speed   = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+fn set_mtime(path: &Path, mtime_secs: u64) {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
 
-    const BAR_W: usize = 20;
-    let bar = if total > 0 {
-        let pct    = (done as f64 / total as f64).min(1.0);
-        let filled = (pct * BAR_W as f64) as usize;
-        format!(
-            "[{}{}] {:3.0}%",
-            "█".repeat(filled),
-            "░".repeat(BAR_W - filled),
-            pct * 100.0
+        if let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) {
+            let times = [
+                libc::timespec { tv_sec: mtime_secs as i64, tv_nsec: 0 },
+                libc::timespec { tv_sec: mtime_secs as i64, tv_nsec: 0 },
+            ];
+            unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mtime_secs);
+    }
+}
+
+fn make_progress_bar(label: &str, total: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{prefix:.bold} [{bar:30.cyan/dim}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}",
         )
-    } else {
-        format!("[{}] ?%", "█".repeat(BAR_W))
-    };
-
-    let eta = if speed > 0.0 && total > done {
-        fmt_duration(std::time::Duration::from_secs_f64((total - done) as f64 / speed))
-    } else {
-        String::new()
-    };
-
-    let label_trunc = truncate(label, 18);
-    eprint!(
-        "\r{:<18} {}  {}  {}   ",
-        label_trunc, bar, fmt_speed(speed), eta
+        .unwrap()
+        .progress_chars("=> "),
     );
-    let _ = std::io::stderr().flush();
+    pb.set_prefix(label.to_owned());
+    pb
 }
 
-fn finish_progress(label: &str, done: u64, start: Instant) {
-    let elapsed = start.elapsed().as_secs_f64();
-    let speed   = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
-    eprintln!(
-        "\r{:<18} [{}] 100%  {}  {}  done",
-        truncate(label, 18),
-        "█".repeat(20),
-        fmt_speed(speed),
-        fmt_bytes(done as i64),
-    );
-}
-
-fn fmt_speed(bps: f64) -> String {
-    match bps as u64 {
-        n if n >= 1 << 30 => format!("{:5.1} GB/s", bps / (1u64 << 30) as f64),
-        n if n >= 1 << 20 => format!("{:5.1} MB/s", bps / (1u64 << 20) as f64),
-        n if n >= 1 << 10 => format!("{:5.1} KB/s", bps / (1u64 << 10) as f64),
-        _                  => format!("{:5.0}  B/s", bps),
-    }
-}
-
-fn fmt_bytes(b: i64) -> String {
-    match b.unsigned_abs() {
-        n if n >= 1 << 30 => format!("{:.2} GB", n as f64 / (1u64 << 30) as f64),
-        n if n >= 1 << 20 => format!("{:.2} MB", n as f64 / (1u64 << 20) as f64),
-        n if n >= 1 << 10 => format!("{:.2} KB", n as f64 / (1u64 << 10) as f64),
-        n                  => format!("{} B", n),
-    }
-}
-
-fn fmt_duration(d: std::time::Duration) -> String {
-    let s = d.as_secs();
-    let h = s / 3600;
-    let m = (s % 3600) / 60;
-    let s = s % 60;
-    if h > 0 { format!("{}h{:02}m{:02}s", h, m, s) }
-    else if m > 0 { format!("{}m{:02}s", m, s) }
-    else { format!("{}s", s) }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.to_owned() }
-    else {
-        let mut t: String = s.chars().take(n - 1).collect();
-        t.push('…');
-        t
-    }
-}
-
-/// Export fmt_bytes for transfer_dir
-pub fn format_bytes(b: i64) -> String { fmt_bytes(b) }
-
-use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use nix::libc;
