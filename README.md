@@ -100,8 +100,61 @@ bolt -L 5432:db-host:5432 user@host
 # Forward in background + run command
 bolt -L 8080:localhost:80 user@host -c "echo forwarding active && sleep 3600"
 
-# Full spec: local_host:local_port:remote_host:remote_port
-bolt -L 127.0.0.1:8080:app-server:8080 user@host
+# Remote forward: server binds :2222, tunnels to localhost:22
+bolt -R 2222:localhost:22 user@host
+```
+
+### SSH Agent Forwarding
+
+```bash
+# Forward your local SSH agent to the remote session
+bolt --agent user@host
+
+# Useful for Git operations via SSH on the remote host
+bolt --agent user@host -c "git clone git@github.com:org/repo"
+```
+
+### Filesystem Operations
+
+```bash
+# Stat a remote file
+bolt fs stat user@host:/etc/hosts
+
+# List remote directory
+bolt fs ls user@host:/var/log
+
+# Rename / move
+bolt fs mv user@host:/tmp/old.txt user@host:/tmp/new.txt
+
+# Remove file (recursive with -r)
+bolt fs rm user@host:/tmp/file.txt
+bolt fs rm -r user@host:/tmp/dir
+
+# Create directory with permissions
+bolt fs mkdir --mode 755 user@host:/var/app
+
+# Change permissions
+bolt fs chmod 644 user@host:/etc/app/config.toml
+```
+
+### Certificate Authority
+
+```bash
+# Initialize CA (generates ~/.bolt/ca_key + ca_key.pub)
+bolt ca init
+
+# Sign a user certificate (valid 365 days)
+bolt ca sign alice --pubkey ~/.bolt/id_bolt.pub --days 365
+
+# Custom CA key and output path
+bolt ca sign alice --pubkey alice.pub --ca-key /etc/bolt/ca_key \
+     --output /etc/bolt/certs/alice.cert
+
+# Server: trust a CA (add pub key to trusted list)
+echo $(cat ~/.bolt/ca_key.pub) >> ~/.bolt/ca_keys
+
+# Server: start with CA key trust
+boltd --ca-keys ~/.bolt/ca_keys
 ```
 
 ### File Transfer
@@ -205,6 +258,7 @@ rate_limit_window_secs = 60
 host_key             = "/etc/bolt/host_key"
 cert                 = "/etc/bolt/host_cert.der"
 authorized_keys      = "/etc/bolt/authorized_keys"
+ca_keys              = "/etc/bolt/ca_keys"   # optional: enable cert auth
 log_format           = "text"   # or "json"
 ```
 
@@ -437,10 +491,12 @@ bolt-rs/
 | Encryption | TLS 1.3 (AES-128-GCM / ChaCha20-Poly1305) |
 | Forward secrecy | TLS ephemeral key exchange per session |
 | Host verification | TOFU SHA-256 fingerprint in `~/.bolt/known_hosts` |
-| Client auth | Ed25519 public key (or password fallback on Linux) |
+| Client auth | Ed25519 public key, password (Linux), or CA-signed cert |
+| Certificate auth | BoltCert: `sha256(user\|\|pubkey\|\|expiry)` signed with CA Ed25519 |
 | Transfer integrity | SHA-256 checksum on every file/delta |
 | Rate limiting | Max connections per IP + burst limit |
 | Env forwarding | Server-side allowlist (LANG, TZ, EDITOR, GIT_*, ...) |
+| Agent forwarding | SSH agent socket proxied over QUIC (SSH_AUTH_SOCK) |
 
 Key locations:
 
@@ -451,6 +507,12 @@ Key locations:
 ~/.bolt/host_key             # Server private key
 ~/.bolt/host_cert.der        # Server TLS cert (persisted for stable fingerprint)
 ~/.bolt/authorized_keys      # Server: one ed25519 pubkey per line
+~/.bolt/ca_key               # CA private key (bolt ca init)
+~/.bolt/ca_key.pub           # CA public key
+~/.bolt/ca_keys              # Server: trusted CA public keys (one per line)
+~/.bolt/certs/<user>.cert    # Signed user certificate
+~/.bolt/session_cache        # TLS session cache (0-RTT)
+~/.bolt/ctrl/<host>.sock     # ControlMaster socket
 ~/.bolt/config               # Client config (TOML)
 /etc/bolt/boltd.toml         # Server config (TOML)
 ```
@@ -512,13 +574,13 @@ cargo run --bin bolt -- -L 8080:localhost:8080 $USER@127.0.0.1
 - [x] Keepalive / heartbeat (Ping/Pong)
 - [x] Shell completion (bash/zsh/fish)
 - [x] systemd socket activation
-- [ ] Remote port forwarding (`-R`)
-- [ ] 0-RTT session resume
-- [ ] Windows ConPTY support
-- [ ] SFTP subsystem
-- [ ] SSH agent forwarding
-- [ ] ControlMaster (connection multiplexing)
-- [ ] Certificate authority (CA-signed keys)
+- [x] Remote port forwarding (`-R`)
+- [x] 0-RTT session resume (in-process; file-backed store available)
+- [x] Windows ConPTY support (`#[cfg(windows)]` via `windows-sys`)
+- [x] SFTP subsystem (`bolt fs stat/ls/mv/rm/mkdir/chmod`)
+- [x] SSH agent forwarding (`--agent`)
+- [x] ControlMaster (connection multiplexing via Unix socket)
+- [x] Certificate authority (`bolt ca init` / `bolt ca sign`)
 
 ---
 

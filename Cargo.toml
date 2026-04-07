@@ -51,6 +51,7 @@ sha2         = "0.10"
 rand         = "0.8"
 base64       = "0.22"
 zeroize      = "1"
+ring         = "0.17"
 
 # Bytes / IO
 bytes = "1"
@@ -63,6 +64,15 @@ indicatif = "0.17"
 
 # Unix / PTY
 nix = { version = "0.28", features = ["ioctl", "signal", "term", "process", "fs"] }
+
+# Windows ConPTY
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 # Rsync delta sync
 fast_rsync = "0.2"

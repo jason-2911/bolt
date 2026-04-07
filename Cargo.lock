@@ -108,6 +108,7 @@ name = "bolt"
 version = "1.0.0-dev"
 dependencies = [
  "anyhow",
+ "base64",
  "bolt-client",
  "bolt-crypto",
  "bolt-log",
@@ -150,10 +151,15 @@ version = "1.0.0-dev"
 dependencies = [
  "anyhow",
  "base64",
+ "bincode",
+ "dirs",
  "quinn",
  "rand 0.8.5",
  "rcgen",
+ "ring",
  "rustls",
+ "serde",
+ "sha2",
  "thiserror 2.0.18",
  "zeroize",
 ]
@@ -196,6 +202,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "windows-sys 0.52.0",
  "zstd",
 ]
 
