@@ -427,21 +427,23 @@ fn inject_input(attached_window_id: Option<u64>, event: InputEvent) {
     }
 
     #[cfg(not(target_os = "linux"))]
-    let _ = attached_window_id;
+    {
+        let _ = attached_window_id;
 
-    // Hook point: replace with XTest/uinput/win32 SendInput implementation.
-    match event {
-        InputEvent::Key { code, down } => {
-            info!(code, down, "inject key");
-        }
-        InputEvent::MouseMove { x, y } => {
-            info!(x, y, "inject mouse move");
-        }
-        InputEvent::MouseButton { button, down } => {
-            info!(?button, down, "inject mouse button");
-        }
-        InputEvent::MouseWheel { dx, dy } => {
-            info!(dx, dy, "inject mouse wheel");
+        // Hook point: replace with XTest/uinput/win32 SendInput implementation.
+        match event {
+            InputEvent::Key { code, down } => {
+                info!(code, down, "inject key");
+            }
+            InputEvent::MouseMove { x, y } => {
+                info!(x, y, "inject mouse move");
+            }
+            InputEvent::MouseButton { button, down } => {
+                info!(?button, down, "inject mouse button");
+            }
+            InputEvent::MouseWheel { dx, dy } => {
+                info!(dx, dy, "inject mouse wheel");
+            }
         }
     }
 }
@@ -814,21 +816,21 @@ fn inject_linux_event(
     event: &InputEvent,
 ) -> anyhow::Result<()> {
     unsafe {
-        match *event {
+        match event {
             InputEvent::Key { code, down } => {
-                if let Some(keysym) = minifb_key_to_x11_keysym(code) {
+                if let Some(keysym) = minifb_key_to_x11_keysym(*code) {
                     let keycode = XKeysymToKeycode(display, keysym);
                     if keycode == 0 {
                         return Ok(());
                     }
                     XSetInputFocus(display, target.window, REVERT_TO_POINTER_ROOT, CURRENT_TIME);
                     XRaiseWindow(display, target.window);
-                    XTestFakeKeyEvent(display, keycode as u32, bool_to_x11(down), CURRENT_TIME);
+                    XTestFakeKeyEvent(display, keycode as u32, bool_to_x11(*down), CURRENT_TIME);
                 }
             }
             InputEvent::MouseMove { x, y } => {
-                let local_x = x.clamp(0, target.width.saturating_sub(1) as i32);
-                let local_y = y.clamp(0, target.height.saturating_sub(1) as i32);
+                let local_x = (*x).clamp(0, target.width.saturating_sub(1) as i32);
+                let local_y = (*y).clamp(0, target.height.saturating_sub(1) as i32);
                 XTestFakeMotionEvent(
                     display,
                     -1,
@@ -845,27 +847,27 @@ fn inject_linux_event(
                 };
                 XSetInputFocus(display, target.window, REVERT_TO_POINTER_ROOT, CURRENT_TIME);
                 XRaiseWindow(display, target.window);
-                XTestFakeButtonEvent(display, button_id, bool_to_x11(down), CURRENT_TIME);
+                XTestFakeButtonEvent(display, button_id, bool_to_x11(*down), CURRENT_TIME);
             }
             InputEvent::MouseWheel { dx, dy } => {
-                if dx > 0 {
-                    for _ in 0..dx {
+                if *dx > 0 {
+                    for _ in 0..*dx {
                         XTestFakeButtonEvent(display, 7, TRUE, CURRENT_TIME);
                         XTestFakeButtonEvent(display, 7, FALSE, CURRENT_TIME);
                     }
                 } else {
-                    for _ in 0..dx.unsigned_abs() {
+                    for _ in 0..(*dx).unsigned_abs() {
                         XTestFakeButtonEvent(display, 6, TRUE, CURRENT_TIME);
                         XTestFakeButtonEvent(display, 6, FALSE, CURRENT_TIME);
                     }
                 }
-                if dy > 0 {
-                    for _ in 0..dy {
+                if *dy > 0 {
+                    for _ in 0..*dy {
                         XTestFakeButtonEvent(display, 4, TRUE, CURRENT_TIME);
                         XTestFakeButtonEvent(display, 4, FALSE, CURRENT_TIME);
                     }
                 } else {
-                    for _ in 0..dy.unsigned_abs() {
+                    for _ in 0..(*dy).unsigned_abs() {
                         XTestFakeButtonEvent(display, 5, TRUE, CURRENT_TIME);
                         XTestFakeButtonEvent(display, 5, FALSE, CURRENT_TIME);
                     }
@@ -1268,7 +1270,8 @@ fn read_x11_pixel(bytes: &[u8], byte_order: i32) -> u64 {
     let mut buf = [0_u8; 8];
     let len = bytes.len().min(buf.len());
     if byte_order == MSB_FIRST {
-        buf[buf.len() - len..].copy_from_slice(&bytes[..len]);
+        let start = buf.len() - len;
+        buf[start..].copy_from_slice(&bytes[..len]);
         u64::from_be_bytes(buf)
     } else {
         buf[..len].copy_from_slice(&bytes[..len]);

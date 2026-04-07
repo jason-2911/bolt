@@ -17,6 +17,15 @@ use crate::{
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(all(unix, target_os = "linux"))]
+#[link(name = "crypt")]
+unsafe extern "C" {
+    fn crypt(
+        key: *const std::os::raw::c_char,
+        salt: *const std::os::raw::c_char,
+    ) -> *mut std::os::raw::c_char;
+}
+
 pub async fn handle_connection(
     conn: Connection,
     auth: Option<Arc<Authenticator>>,
@@ -310,12 +319,11 @@ fn verify_password_passwd(user: &str, password: &str) -> Result<(), String> {
 
 #[cfg(all(unix, target_os = "linux"))]
 fn verify_crypt(password: &str, hash: &str) -> Result<(), String> {
-    use nix::libc;
     use std::ffi::CString;
 
     let c_pw = CString::new(password).map_err(|e| e.to_string())?;
     let c_hash = CString::new(hash).map_err(|e| e.to_string())?;
-    let result = unsafe { libc::crypt(c_pw.as_ptr(), c_hash.as_ptr()) };
+    let result = unsafe { crypt(c_pw.as_ptr(), c_hash.as_ptr()) };
     if result.is_null() {
         return Err("crypt failed".into());
     }
