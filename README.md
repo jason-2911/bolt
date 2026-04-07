@@ -23,8 +23,8 @@
 ### Build
 
 ```bash
-git clone https://github.com/yourname/bolt-rs
-cd bolt-rs
+git clone https://github.com/jason-2911/bolt
+cd bolt
 cargo build --release
 # binaries: target/release/bolt  target/release/boltd
 ```
