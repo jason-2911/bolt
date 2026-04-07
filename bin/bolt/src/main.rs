@@ -5,10 +5,20 @@
 //!   bolt user@host -c "ls -la"              # execute remote command
 //!   bolt -J user@bastion user@host          # jump through bastion
 //!   bolt -L 8080:localhost:80 user@host     # local port forward
+//!   bolt -R 2222:localhost:22 user@host     # remote port forward
+//!   bolt --agent user@host                  # SSH agent forwarding
 //!   bolt cp file.txt user@host:/path        # upload file
 //!   bolt cp user@host:/path ./local         # download file
 //!   bolt cp -r dir/ user@host:/path         # upload directory
 //!   bolt cp -p file user@host:/path         # upload, preserve timestamps
+//!   bolt fs stat user@host:/path            # stat remote file
+//!   bolt fs ls user@host:/path              # list remote directory
+//!   bolt fs mv user@host:/old user@host:/new
+//!   bolt fs rm [-r] user@host:/path
+//!   bolt fs mkdir user@host:/path
+//!   bolt fs chmod 755 user@host:/path
+//!   bolt ca init                            # generate CA keypair
+//!   bolt ca sign <user> [days]              # sign a user cert
 //!   bolt keygen                             # generate Ed25519 keypair
 //!   bolt completions bash                   # shell completion script
 
@@ -23,15 +33,21 @@ use clap_complete::Shell;
 use tracing::Level;
 
 use bolt_client::{
+    agent::request_agent_forward,
     client::{Client, ClientConfig},
     config::{BoltConfig, parse_ssh_config},
     exec::exec,
     forward::{run_local_forward, LocalForward},
+    fs::{fs_chmod, fs_ls, fs_mkdir, fs_remove, fs_rename, fs_stat},
+    remote_forward::{run_remote_forward, RemoteForward},
     shell::shell,
     transfer::{download_opts, upload_opts},
     transfer_dir::{download_dir_opts, upload_dir_opts},
 };
-use bolt_crypto::keys::KeyPair;
+use bolt_crypto::{
+    ca::BoltCert,
+    keys::KeyPair,
+};
 use bolt_log::{init as log_init, Config as LogConfig};
 
 // ── CLI ───────────────────────────────────────────────────────────────────
@@ -63,6 +79,14 @@ struct Args {
     #[arg(short = 'L', long, global = true)]
     forward_local: Option<String>,
 
+    /// Remote port forwarding: remote_port:local_host:local_port
+    #[arg(short = 'R', long, global = true)]
+    forward_remote: Option<String>,
+
+    /// Enable SSH agent forwarding
+    #[arg(long, global = true)]
+    agent: bool,
+
     #[command(subcommand)]
     command: Cmd,
 }
@@ -82,6 +106,20 @@ enum Cmd {
         preserve: bool,
     },
 
+    /// Remote filesystem operations: stat, ls, mv, rm, mkdir, chmod
+    #[command(name = "fs")]
+    Fs {
+        #[command(subcommand)]
+        op: FsOp,
+    },
+
+    /// Certificate authority operations: init, sign
+    #[command(name = "ca")]
+    Ca {
+        #[command(subcommand)]
+        op: CaOp,
+    },
+
     /// Generate a new Ed25519 keypair
     #[command(name = "keygen")]
     Keygen {
@@ -98,6 +136,75 @@ enum Cmd {
     /// Catch-all: bolt [user@host] [-c command]
     #[command(external_subcommand)]
     Remote(Vec<OsString>),
+}
+
+#[derive(Subcommand, Debug)]
+enum FsOp {
+    /// Print file metadata
+    #[command(name = "stat")]
+    Stat { target: String },
+
+    /// List directory
+    #[command(name = "ls")]
+    Ls { target: String },
+
+    /// Rename / move
+    #[command(name = "mv")]
+    Mv { from: String, to: String },
+
+    /// Remove file or directory
+    #[command(name = "rm")]
+    Rm {
+        target: String,
+        #[arg(short = 'r', long)]
+        recursive: bool,
+    },
+
+    /// Create directory
+    #[command(name = "mkdir")]
+    Mkdir {
+        target: String,
+        /// Octal permissions (default 755)
+        #[arg(long, default_value_t = 0o755)]
+        mode: u32,
+    },
+
+    /// Change file permissions
+    #[command(name = "chmod")]
+    Chmod {
+        /// Octal mode, e.g. 644
+        mode: String,
+        target: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CaOp {
+    /// Generate CA keypair → ~/.bolt/ca_key[.pub]
+    #[command(name = "init")]
+    Init {
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Sign a user certificate → ~/.bolt/certs/<user>.cert
+    #[command(name = "sign")]
+    Sign {
+        /// Username to certify
+        user: String,
+        /// Path to the user's public key file
+        #[arg(long)]
+        pubkey: PathBuf,
+        /// Validity in days (default 365)
+        #[arg(long, default_value_t = 365)]
+        days: u64,
+        /// CA private key (default ~/.bolt/ca_key)
+        #[arg(long)]
+        ca_key: Option<PathBuf>,
+        /// Output certificate path
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────
@@ -124,11 +231,13 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Cp { ref source, ref dest, recursive, preserve } => {
             run_copy(&args, source, dest, recursive, preserve).await
         }
+        Cmd::Fs { ref op } => run_fs(&args, op).await,
+        Cmd::Ca { ref op } => run_ca(op),
         Cmd::Remote(ref remote_args) => run_remote(&args, remote_args).await,
     }
 }
 
-// ── bolt user@host [-c command] [-L ...] ─────────────────────────────────
+// ── bolt user@host [-c command] [-L ...] [-R ...] [--agent] ──────────────
 
 async fn run_remote(args: &Args, remote_args: &[OsString]) -> anyhow::Result<()> {
     if remote_args.is_empty() {
@@ -141,7 +250,6 @@ async fn run_remote(args: &Args, remote_args: &[OsString]) -> anyhow::Result<()>
     let cfg = BoltConfig::load();
     let resolved = cfg.resolve_target(target, args.port, args.identity.as_deref());
 
-    // Merge jump: CLI -J overrides config
     let jump = args.jump.as_deref().or(resolved.jump.as_deref());
 
     let client = make_client(args, &resolved.identity)?;
@@ -154,11 +262,39 @@ async fn run_remote(args: &Args, remote_args: &[OsString]) -> anyhow::Result<()>
         client.connect(&resolved.addr(), &resolved.user).await?
     };
 
-    // Local port forwarding: start in background, then run shell/exec
+    // SSH agent forwarding
+    let _agent_handle = if args.agent {
+        match request_agent_forward(&session).await {
+            Ok(h) => {
+                eprintln!("bolt: agent forwarding active");
+                Some(h)
+            }
+            Err(e) => {
+                eprintln!("bolt: agent forward failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Remote port forwarding: start in background
+    if let Some(ref rfwd_spec) = args.forward_remote {
+        let rfwd = RemoteForward::parse(rfwd_spec)?;
+        let fwd_conn = session.conn.clone();
+        tokio::spawn(async move {
+            let s = bolt_client::client::Session { conn: fwd_conn };
+            if let Err(e) = run_remote_forward(&s, rfwd).await {
+                tracing::warn!("remote forward: {e}");
+            }
+        });
+    }
+
+    // Local port forwarding
     if let Some(ref fwd_spec) = args.forward_local {
         let fwd = LocalForward::parse(fwd_spec)?;
 
-        if command.is_none() {
+        if command.is_none() && args.forward_remote.is_none() {
             // -L only, no shell: just forward until Ctrl+C
             tokio::select! {
                 res = run_local_forward(&session, fwd) => res?,
@@ -169,11 +305,11 @@ async fn run_remote(args: &Args, remote_args: &[OsString]) -> anyhow::Result<()>
             return Ok(());
         }
 
-        // -L with -c: forward in background, run command
-        let fwd_session_conn = session.conn.clone();
+        // -L with shell/command: forward in background
+        let fwd_conn = session.conn.clone();
         tokio::spawn(async move {
-            let fwd_session = bolt_client::client::Session { conn: fwd_session_conn };
-            if let Err(e) = run_local_forward(&fwd_session, fwd).await {
+            let s = bolt_client::client::Session { conn: fwd_conn };
+            if let Err(e) = run_local_forward(&s, fwd).await {
                 tracing::warn!("forward: {e}");
             }
         });
@@ -264,6 +400,140 @@ async fn run_copy(
     }
 }
 
+// ── bolt fs ───────────────────────────────────────────────────────────────
+
+async fn run_fs(args: &Args, op: &FsOp) -> anyhow::Result<()> {
+    let cfg = BoltConfig::load();
+
+    match op {
+        FsOp::Stat { target } => {
+            let (user, host, path) = parse_remote_path(target)?;
+            let session = connect_for_host(args, &cfg, &user, &host).await?;
+            fs_stat(&session, &path).await
+        }
+        FsOp::Ls { target } => {
+            let (user, host, path) = parse_remote_path(target)?;
+            let session = connect_for_host(args, &cfg, &user, &host).await?;
+            fs_ls(&session, &path).await
+        }
+        FsOp::Mv { from, to } => {
+            // Both must be on the same host (parsed from `from`)
+            let (user, host, from_path) = parse_remote_path(from)?;
+            let (_, _, to_path) = parse_remote_path(to).unwrap_or_else(|_| {
+                (user.clone(), host.clone(), to.clone())
+            });
+            let session = connect_for_host(args, &cfg, &user, &host).await?;
+            fs_rename(&session, &from_path, &to_path).await
+        }
+        FsOp::Rm { target, recursive } => {
+            let (user, host, path) = parse_remote_path(target)?;
+            let session = connect_for_host(args, &cfg, &user, &host).await?;
+            fs_remove(&session, &path, *recursive).await
+        }
+        FsOp::Mkdir { target, mode } => {
+            let (user, host, path) = parse_remote_path(target)?;
+            let session = connect_for_host(args, &cfg, &user, &host).await?;
+            fs_mkdir(&session, &path, *mode).await
+        }
+        FsOp::Chmod { mode, target } => {
+            let mode_val = u32::from_str_radix(mode, 8)
+                .with_context(|| format!("invalid octal mode: {mode}"))?;
+            let (user, host, path) = parse_remote_path(target)?;
+            let session = connect_for_host(args, &cfg, &user, &host).await?;
+            fs_chmod(&session, &path, mode_val).await
+        }
+    }
+}
+
+async fn connect_for_host(
+    args: &Args,
+    cfg: &BoltConfig,
+    user: &str,
+    host: &str,
+) -> anyhow::Result<bolt_client::client::Session> {
+    let target = format!("{user}@{host}");
+    let resolved = cfg.resolve_target(&target, args.port, args.identity.as_deref());
+    let addr = format!("{}:{}", resolved.host, resolved.port);
+    let client = make_client(args, &resolved.identity)?;
+    client.connect(&addr, &resolved.user).await
+}
+
+// ── bolt ca ───────────────────────────────────────────────────────────────
+
+fn run_ca(op: &CaOp) -> anyhow::Result<()> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+
+    match op {
+        CaOp::Init { output } => {
+            let key_path = output
+                .clone()
+                .unwrap_or_else(|| home.join(".bolt/ca_key"));
+            let ca = KeyPair::generate().context("generate CA keypair")?;
+            ca.save(&key_path).context("save CA key")?;
+
+            eprintln!("CA private key:  {}", key_path.display());
+            eprintln!("CA public key:   {}.pub", key_path.display());
+            eprintln!("Fingerprint:     {}", ca.fingerprint());
+            eprintln!();
+            eprintln!("Add the CA public key to boltd's trusted keys:");
+            eprintln!("  echo $(cat {}.pub) >> ~/.bolt/ca_keys", key_path.display());
+
+            Ok(())
+        }
+
+        CaOp::Sign { user, pubkey, days, ca_key, output } => {
+            let ca_key_path = ca_key
+                .clone()
+                .unwrap_or_else(|| home.join(".bolt/ca_key"));
+
+            let ca = KeyPair::load(&ca_key_path)
+                .with_context(|| format!("load CA key: {}", ca_key_path.display()))?;
+
+            // Load user's public key (raw 32-byte or base64)
+            let pubkey_bytes = std::fs::read(pubkey)
+                .with_context(|| format!("read pubkey: {}", pubkey.display()))?;
+            let user_public_key = parse_public_key(&pubkey_bytes)?;
+
+            let cert = BoltCert::sign(user, user_public_key, *days, &ca)
+                .context("sign certificate")?;
+
+            let cert_path = output
+                .clone()
+                .unwrap_or_else(|| BoltCert::default_path(user));
+
+            cert.save(&cert_path)
+                .with_context(|| format!("save cert: {}", cert_path.display()))?;
+
+            eprintln!("Certificate:  {}", cert_path.display());
+            eprintln!("User:         {user}");
+            eprintln!("Valid for:    {days} days");
+            Ok(())
+        }
+    }
+}
+
+fn parse_public_key(bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
+    // Try raw 32 bytes first
+    if bytes.len() == 32 {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(bytes);
+        return Ok(k);
+    }
+    // Try base64 (with or without trailing newline)
+    let trimmed = std::str::from_utf8(bytes)?.trim();
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        trimmed,
+    )
+    .context("decode public key as base64")?;
+    if decoded.len() != 32 {
+        bail!("public key must be 32 bytes (got {})", decoded.len());
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&decoded);
+    Ok(k)
+}
+
 // ── bolt keygen ───────────────────────────────────────────────────────────
 
 fn run_keygen(output: Option<&Path>) -> anyhow::Result<()> {
@@ -304,8 +574,7 @@ fn make_client(
         .or_else(|| config_identity.clone())
         .unwrap_or_else(|| home.join(".bolt/id_bolt"));
 
-    // Also merge SSH config entries as fallback
-    let _ssh_hosts = parse_ssh_config(); // available for future host alias merging
+    let _ssh_hosts = parse_ssh_config();
 
     Client::new(ClientConfig {
         identity_file,
