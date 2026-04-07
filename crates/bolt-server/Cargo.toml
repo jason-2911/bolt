@@ -1,0 +1,21 @@
+[package]
+name    = "bolt-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bolt-proto     = { workspace = true }
+bolt-crypto    = { workspace = true }
+bolt-transport = { workspace = true }
+bolt-session   = { workspace = true }
+bolt-log       = { workspace = true }
+
+tokio     = { workspace = true }
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+sha2      = { workspace = true }
+bytes     = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }

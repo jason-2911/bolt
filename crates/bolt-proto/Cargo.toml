@@ -1,0 +1,10 @@
+[package]
+name    = "bolt-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+bytes     = { workspace = true }
+bitflags  = "2"
+rand      = { workspace = true }

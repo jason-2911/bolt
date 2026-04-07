@@ -1,0 +1,18 @@
+[package]
+name    = "bolt"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "bolt"
+path = "src/main.rs"
+
+[dependencies]
+bolt-log    = { workspace = true }
+bolt-client = { workspace = true }
+bolt-crypto = { workspace = true }
+
+tokio   = { workspace = true }
+anyhow  = { workspace = true }
+tracing = { workspace = true }
+clap    = { workspace = true }

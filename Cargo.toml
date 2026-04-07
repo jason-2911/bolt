@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bolt-proto",
+    "crates/bolt-crypto",
+    "crates/bolt-transport",
+    "crates/bolt-session",
+    "crates/bolt-log",
+    "crates/bolt-server",
+    "crates/bolt-client",
+    "bin/bolt",
+    "bin/boltd",
+]
+
+[workspace.package]
+version     = "1.0.0-dev"
+edition     = "2021"
+authors     = ["Bolt Protocol"]
+license     = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+bolt-proto     = { path = "crates/bolt-proto" }
+bolt-crypto    = { path = "crates/bolt-crypto" }
+bolt-transport = { path = "crates/bolt-transport" }
+bolt-session   = { path = "crates/bolt-session" }
+bolt-log       = { path = "crates/bolt-log" }
+bolt-server    = { path = "crates/bolt-server" }
+bolt-client    = { path = "crates/bolt-client" }
+
+# Async runtime
+tokio          = { version = "1", features = ["full"] }
+
+# Error handling
+thiserror = "1"
+anyhow    = "1"
+
+# Logging / tracing
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Crypto
+snow        = "0.9"          # Noise Protocol Framework
+x25519-dalek = "2"
+sha2        = "0.10"
+rand        = "0.8"
+base64      = "0.22"
+zeroize     = "1"
+
+# Bytes / IO
+bytes = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Unix / PTY
+nix = { version = "0.28", features = ["ioctl", "signal", "term", "process", "fs"] }
+
+# Filesystem
+walkdir = "2"

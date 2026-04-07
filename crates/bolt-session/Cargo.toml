@@ -1,0 +1,15 @@
+[package]
+name    = "bolt-session"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bolt-proto     = { workspace = true }
+bolt-crypto    = { workspace = true }
+bolt-transport = { workspace = true }
+
+tokio     = { workspace = true }
+bytes     = { workspace = true }
+thiserror = { workspace = true }
+anyhow    = { workspace = true }
+tracing   = { workspace = true }
