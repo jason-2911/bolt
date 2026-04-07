@@ -19,8 +19,8 @@ use crate::client::Session;
 /// Start agent forwarding for a session.
 /// This must be called before `shell()` so the server can set SSH_AUTH_SOCK.
 pub async fn request_agent_forward(session: &Session) -> anyhow::Result<AgentForwardHandle> {
-    let agent_sock = std::env::var("SSH_AUTH_SOCK")
-        .context("SSH_AUTH_SOCK not set — no ssh-agent running?")?;
+    let agent_sock =
+        std::env::var("SSH_AUTH_SOCK").context("SSH_AUTH_SOCK not set — no ssh-agent running?")?;
 
     let (mut send, mut recv) = session.open_bi().await?;
     write_msg(
@@ -55,11 +55,7 @@ pub struct AgentForwardHandle {
     _task: tokio::task::JoinHandle<()>,
 }
 
-async fn relay_agent(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-    agent_path: String,
-) {
+async fn relay_agent(mut send: quinn::SendStream, mut recv: quinn::RecvStream, agent_path: String) {
     #[cfg(unix)]
     {
         use tokio::net::UnixStream;
@@ -87,16 +83,23 @@ async fn relay_agent(
 
             // Read agent response (SSH agent: u32 length + body)
             let mut len_buf = [0u8; 4];
-            if agent.read_exact(&mut len_buf).await.is_err() { break; }
+            if agent.read_exact(&mut len_buf).await.is_err() {
+                break;
+            }
             let len = u32::from_be_bytes(len_buf) as usize;
             let mut body = vec![0u8; len];
-            if agent.read_exact(&mut body).await.is_err() { break; }
+            if agent.read_exact(&mut body).await.is_err() {
+                break;
+            }
 
             let mut resp = Vec::with_capacity(4 + len);
             resp.extend_from_slice(&len_buf);
             resp.extend_from_slice(&body);
 
-            if write_msg(&mut send, &Message::AgentMessage { data: resp }).await.is_err() {
+            if write_msg(&mut send, &Message::AgentMessage { data: resp })
+                .await
+                .is_err()
+            {
                 break;
             }
         }

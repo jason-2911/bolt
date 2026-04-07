@@ -18,14 +18,14 @@ pub enum Format {
 
 /// Logger configuration.
 pub struct Config {
-    pub level:  Level,
+    pub level: Level,
     pub format: Format,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            level:  Level::WARN,
+            level: Level::WARN,
             format: Format::Text,
         }
     }
@@ -56,7 +56,11 @@ pub fn init(cfg: Config) {
 
 /// Parse a format string ("json" | anything else → text).
 pub fn parse_format(s: &str) -> Format {
-    if s.eq_ignore_ascii_case("json") { Format::Json } else { Format::Text }
+    if s.eq_ignore_ascii_case("json") {
+        Format::Json
+    } else {
+        Format::Text
+    }
 }
 
 /// Re-export tracing macros so callers only need `bolt-log`.

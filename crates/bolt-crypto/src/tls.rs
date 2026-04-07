@@ -30,11 +30,12 @@ pub fn server_config(
 
     tls_config.alpn_protocols = vec![b"bolt/1".to_vec()];
 
-    let quic_server_config =
-        quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
-            .map_err(|e| TlsError::Config(e.to_string()))?;
+    let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+        .map_err(|e| TlsError::Config(e.to_string()))?;
 
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_server_config)))
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(
+        quic_server_config,
+    )))
 }
 
 /// Build a quinn `ClientConfig` that skips CA verification.
@@ -64,9 +65,8 @@ fn client_config_inner(
         tls_config.resumption = rustls::client::Resumption::store(store);
     }
 
-    let quic_config =
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
-            .map_err(|e| TlsError::Config(e.to_string()))?;
+    let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
+        .map_err(|e| TlsError::Config(e.to_string()))?;
 
     Ok(quinn::ClientConfig::new(Arc::new(quic_config)))
 }
@@ -81,8 +81,8 @@ fn load_or_generate_cert(
 
     // Try loading existing cert
     if cert_path.exists() {
-        let cert_bytes = fs::read(cert_path)
-            .map_err(|e| TlsError::CertGen(format!("read cert: {e}")))?;
+        let cert_bytes =
+            fs::read(cert_path).map_err(|e| TlsError::CertGen(format!("read cert: {e}")))?;
         let cert_der = CertificateDer::from(cert_bytes);
         return Ok((cert_der, key_der));
     }
@@ -107,11 +107,9 @@ fn load_or_generate_cert(
 
     // Persist the cert
     if let Some(parent) = cert_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| TlsError::CertGen(format!("mkdir: {e}")))?;
+        fs::create_dir_all(parent).map_err(|e| TlsError::CertGen(format!("mkdir: {e}")))?;
     }
-    fs::write(cert_path, &cert_raw)
-        .map_err(|e| TlsError::CertGen(format!("write cert: {e}")))?;
+    fs::write(cert_path, &cert_raw).map_err(|e| TlsError::CertGen(format!("write cert: {e}")))?;
 
     Ok((CertificateDer::from(cert_raw), key_der))
 }

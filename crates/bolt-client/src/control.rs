@@ -30,7 +30,16 @@ use crate::client::Session;
 pub fn control_socket_path(addr: &str) -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     // Sanitize addr: replace special chars with _
-    let safe: String = addr.chars().map(|c| if c.is_alphanumeric() || c == '.' { c } else { '_' }).collect();
+    let safe: String = addr
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     home.join(".bolt/ctrl").join(format!("{safe}.sock"))
 }
 
@@ -84,13 +93,17 @@ impl ControlMaster {
             let _ = std::fs::remove_file(&sock_path);
         });
 
-        Ok(Self { socket_path: socket_path.to_path_buf() })
+        Ok(Self {
+            socket_path: socket_path.to_path_buf(),
+        })
     }
 
     #[cfg(not(unix))]
     pub async fn start(_session: &Session, socket_path: &Path) -> anyhow::Result<Self> {
         warn!("ControlMaster is not supported on this platform");
-        Ok(Self { socket_path: socket_path.to_path_buf() })
+        Ok(Self {
+            socket_path: socket_path.to_path_buf(),
+        })
     }
 }
 
@@ -119,8 +132,8 @@ async fn handle_slave(
     let _command = String::from_utf8_lossy(&cmd_buf).into_owned();
 
     // Open a QUIC stream for this slave
-    let (mut quic_send, mut quic_recv) = conn.open_bi().await
-        .context("open QUIC stream for slave")?;
+    let (mut quic_send, mut quic_recv) =
+        conn.open_bi().await.context("open QUIC stream for slave")?;
 
     // The slave connection itself is a raw byte relay
     // (The slave has already done channel-level negotiation through the master)
@@ -131,7 +144,11 @@ async fn handle_slave(
         loop {
             match unix_r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => { if quic_send.write_all(&buf[..n]).await.is_err() { break; } }
+                Ok(n) => {
+                    if quic_send.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         quic_send.finish().ok();
@@ -142,7 +159,11 @@ async fn handle_slave(
         loop {
             match quic_recv.read(&mut buf).await {
                 Ok(None) | Err(_) => break,
-                Ok(Some(n)) => { if unix_w.write_all(&buf[..n]).await.is_err() { break; } }
+                Ok(Some(n)) => {
+                    if unix_w.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -191,7 +212,9 @@ impl ControlSlave {
         let header = [channel_type, cmd_bytes.len().min(255) as u8];
         self.stream.write_all(&header).await?;
         if !cmd_bytes.is_empty() {
-            self.stream.write_all(&cmd_bytes[..header[1] as usize]).await?;
+            self.stream
+                .write_all(&cmd_bytes[..header[1] as usize])
+                .await?;
         }
 
         let (mut r, mut w) = self.stream.into_split();
@@ -202,7 +225,11 @@ impl ControlSlave {
             loop {
                 match stdin.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if w.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if w.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -213,7 +240,11 @@ impl ControlSlave {
             loop {
                 match r.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if stdout.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if stdout.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });

@@ -17,13 +17,16 @@
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use tokio::signal;
 use tracing::info;
 
 use bolt_log::{init as log_init, parse_format, Config as LogConfig};
-use bolt_server::{Server, ServerConfig};
+use bolt_server::{
+    gui_stream::{run_gui_server, GuiServerConfig},
+    Server, ServerConfig,
+};
 
 // ── CLI ───────────────────────────────────────────────────────────────────
 
@@ -34,6 +37,9 @@ use bolt_server::{Server, ServerConfig};
     version
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+
     /// Config file path
     #[arg(long)]
     config: Option<PathBuf>,
@@ -75,6 +81,26 @@ struct Args {
     verbose: bool,
 }
 
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// UDP GUI streaming server (video send + input receive)
+    #[command(name = "gui")]
+    Gui {
+        /// UDP listen address on server
+        #[arg(long, default_value = "0.0.0.0:5600")]
+        listen: String,
+        /// Optional fixed UDP client endpoint to stream video to
+        #[arg(long)]
+        client: Option<String>,
+        /// Target FPS
+        #[arg(long, default_value_t = 20)]
+        fps: u32,
+        /// Capture source: window|demo
+        #[arg(long, default_value = "window")]
+        source: String,
+    },
+}
+
 // ── Config file ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Default)]
@@ -110,6 +136,31 @@ impl FileConfig {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    if let Some(Cmd::Gui {
+        listen,
+        client,
+        fps,
+        source,
+    }) = &args.command
+    {
+        log_init(LogConfig {
+            level: if args.verbose {
+                tracing::Level::DEBUG
+            } else {
+                tracing::Level::INFO
+            },
+            format: parse_format(args.log_format.as_deref().unwrap_or("text")),
+        });
+
+        return run_gui_server(GuiServerConfig {
+            listen_addr: listen.clone(),
+            client_addr: client.clone(),
+            fps: *fps,
+            source: source.clone(),
+        })
+        .await;
+    }
+
     // Load config file
     let file_cfg = {
         let config_path = args.config.clone().or_else(|| {
@@ -127,7 +178,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Merge: CLI > config file > defaults
-    let log_format_str = args.log_format
+    let log_format_str = args
+        .log_format
         .as_deref()
         .or(file_cfg.log_format.as_deref())
         .unwrap_or("text");
@@ -144,38 +196,54 @@ async fn main() -> anyhow::Result<()> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
 
     let config = ServerConfig {
-        listen_addr: args.listen
+        listen_addr: args
+            .listen
             .or(file_cfg.listen)
             .unwrap_or_else(|| "0.0.0.0:2222".into()),
 
-        host_key_path: args.host_key
+        host_key_path: args
+            .host_key
             .or_else(|| file_cfg.host_key.map(PathBuf::from))
             .unwrap_or_else(|| home.join(".bolt/host_key")),
 
-        cert_path: args.cert
+        cert_path: args
+            .cert
             .or_else(|| file_cfg.cert.map(PathBuf::from))
             .unwrap_or_else(|| home.join(".bolt/host_cert.der")),
 
-        auth_keys_path: args.auth_keys
+        auth_keys_path: args
+            .auth_keys
             .or_else(|| file_cfg.authorized_keys.map(PathBuf::from))
             .unwrap_or_else(|| home.join(".bolt/authorized_keys")),
 
-        max_connections: args.max_connections
+        max_connections: args
+            .max_connections
             .or(file_cfg.max_connections)
             .unwrap_or(1000),
 
-        max_per_ip: args.max_per_ip
-            .or(file_cfg.max_per_ip)
-            .unwrap_or(10),
+        max_per_ip: args.max_per_ip.or(file_cfg.max_per_ip).unwrap_or(10),
 
-        ca_keys_path: args.ca_keys
-            .or_else(|| file_cfg.ca_keys.map(PathBuf::from)),
+        ca_keys_path: args.ca_keys.or_else(|| file_cfg.ca_keys.map(PathBuf::from)),
 
         rate_limit_window_secs: file_cfg.rate_limit_window_secs.unwrap_or(60),
         rate_limit_burst: file_cfg.rate_limit_burst.unwrap_or(20),
     };
 
     let server = Server::new(config).context("init server")?;
+
+    // Built-in GUI UDP service (X-like streaming): no manual setup required.
+    tokio::spawn(async {
+        if let Err(e) = run_gui_server(GuiServerConfig {
+            listen_addr: "0.0.0.0:5600".to_string(),
+            client_addr: None,
+            fps: 30,
+            source: "window".to_string(),
+        })
+        .await
+        {
+            tracing::warn!(error = %e, "built-in GUI service stopped");
+        }
+    });
 
     tokio::select! {
         res = server.listen_and_serve() => res?,

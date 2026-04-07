@@ -20,17 +20,11 @@
 //! Resume:
 //!   Client sends ResumeRequest { path } → server replies ResumeOffset { offset }
 
-use std::{
-    path::Path,
-    time::UNIX_EPOCH,
-};
+use std::{path::Path, time::UNIX_EPOCH};
 
 use anyhow::Context as _;
 use sha2::{Digest, Sha256};
-use tokio::{
-    fs,
-    io::AsyncWriteExt,
-};
+use tokio::{fs, io::AsyncWriteExt};
 use tracing::info;
 
 use bolt_proto::{read_msg, write_msg, Message};
@@ -52,13 +46,11 @@ pub async fn handle_transfer(
         Message::SyncRequest { name, size, mode } => {
             handle_upload(send, recv, &name, size, mode).await
         }
-        Message::ResumeRequest { path } => {
-            handle_resume_query(send, &path).await
-        }
-        Message::DirList { path } => {
-            handle_dir_list(send, &path).await
-        }
-        Message::SyncSignature { .. } | Message::SyncNotFound if command.starts_with("download ") => {
+        Message::ResumeRequest { path } => handle_resume_query(send, &path).await,
+        Message::DirList { path } => handle_dir_list(send, &path).await,
+        Message::SyncSignature { .. } | Message::SyncNotFound
+            if command.starts_with("download ") =>
+        {
             let remote_path = command.trim_start_matches("download ").trim();
             handle_download(send, recv, remote_path, msg).await
         }
@@ -78,10 +70,7 @@ pub async fn handle_transfer(
 
 // ── Resume query ──────────────────────────────────────────────────────────
 
-async fn handle_resume_query(
-    send: &mut quinn::SendStream,
-    path: &str,
-) -> anyhow::Result<()> {
+async fn handle_resume_query(send: &mut quinn::SendStream, path: &str) -> anyhow::Result<()> {
     let offset = match fs::metadata(path).await {
         Ok(meta) => meta.len(),
         Err(_) => 0,
@@ -92,14 +81,18 @@ async fn handle_resume_query(
 
 // ── Directory listing ─────────────────────────────────────────────────────
 
-async fn handle_dir_list(
-    send: &mut quinn::SendStream,
-    path: &str,
-) -> anyhow::Result<()> {
+async fn handle_dir_list(send: &mut quinn::SendStream, path: &str) -> anyhow::Result<()> {
     let mut rd = match fs::read_dir(path).await {
         Ok(rd) => rd,
         Err(e) => {
-            write_msg(send, &Message::FileFail { reason: format!("readdir {path}: {e}") }).await.ok();
+            write_msg(
+                send,
+                &Message::FileFail {
+                    reason: format!("readdir {path}: {e}"),
+                },
+            )
+            .await
+            .ok();
             return Ok(());
         }
     };
@@ -109,7 +102,14 @@ async fn handle_dir_list(
             Ok(Some(e)) => e,
             Ok(None) => break,
             Err(e) => {
-                write_msg(send, &Message::FileFail { reason: e.to_string() }).await.ok();
+                write_msg(
+                    send,
+                    &Message::FileFail {
+                        reason: e.to_string(),
+                    },
+                )
+                .await
+                .ok();
                 return Ok(());
             }
         };
@@ -237,7 +237,9 @@ async fn receive_full(
     };
 
     let (mtime, compress, resume_offset) = match &msg {
-        Message::FileHeader { mtime, compress, .. } => (*mtime, *compress, 0u64),
+        Message::FileHeader {
+            mtime, compress, ..
+        } => (*mtime, *compress, 0u64),
         // Legacy: no header, treat first message as chunk with no metadata
         other => {
             return receive_full_from(send, recv, remote_path, mode, other.clone(), false, 0).await;
@@ -327,7 +329,11 @@ async fn receive_full_from(
                     set_mtime(remote_path, mtime);
                 }
 
-                info!(path = remote_path, size = received, "upload complete (full)");
+                info!(
+                    path = remote_path,
+                    size = received,
+                    "upload complete (full)"
+                );
                 write_msg(send, &Message::FileAck).await?;
                 return Ok(());
             }
@@ -375,9 +381,7 @@ async fn handle_download(
         Message::SyncSignature { signature } => {
             send_delta(send, recv, remote_path, &file_data, &signature).await
         }
-        Message::SyncNotFound => {
-            send_full(send, recv, remote_path, &file_data, mode, mtime).await
-        }
+        Message::SyncNotFound => send_full(send, recv, remote_path, &file_data, mode, mtime).await,
         _ => unreachable!(),
     }
 }
@@ -399,7 +403,15 @@ async fn send_delta(
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            return send_full(send, recv, remote_path, file_data, get_file_mode(&meta), mtime).await;
+            return send_full(
+                send,
+                recv,
+                remote_path,
+                file_data,
+                get_file_mode(&meta),
+                mtime,
+            )
+            .await;
         }
     };
 
@@ -481,7 +493,12 @@ async fn send_full(
     let sha256: [u8; 32] = hasher.finalize().into();
     write_msg(send, &Message::FileEnd { sha256 }).await?;
 
-    info!(path = remote_path, size = file_data.len(), compress, "download complete (full)");
+    info!(
+        path = remote_path,
+        size = file_data.len(),
+        compress,
+        "download complete (full)"
+    );
     Ok(())
 }
 
@@ -534,7 +551,12 @@ async fn create_file(path: &str, _mode: u32) -> anyhow::Result<fs::File> {
     }
 }
 
-async fn write_file_atomic(path: &str, data: &[u8], mode: u32, mtime: Option<u64>) -> anyhow::Result<()> {
+async fn write_file_atomic(
+    path: &str,
+    data: &[u8],
+    mode: u32,
+    mtime: Option<u64>,
+) -> anyhow::Result<()> {
     let tmp = format!("{path}.bolt-tmp");
     {
         let mut f = create_file(&tmp, mode).await?;
@@ -553,13 +575,19 @@ async fn write_file_atomic(path: &str, data: &[u8], mode: u32, mtime: Option<u64
 fn set_mtime(path: &str, mtime_secs: u64) {
     #[cfg(unix)]
     {
-        use std::ffi::CString;
         use nix::libc;
+        use std::ffi::CString;
 
         if let Ok(c_path) = CString::new(path) {
             let times = [
-                libc::timespec { tv_sec: mtime_secs as i64, tv_nsec: 0 },
-                libc::timespec { tv_sec: mtime_secs as i64, tv_nsec: 0 },
+                libc::timespec {
+                    tv_sec: mtime_secs as i64,
+                    tv_nsec: 0,
+                },
+                libc::timespec {
+                    tv_sec: mtime_secs as i64,
+                    tv_nsec: 0,
+                },
             ];
             unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
         }

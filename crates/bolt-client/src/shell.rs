@@ -26,7 +26,7 @@ const FORWARD_ENV: &[&str] = &[
     "GIT_COMMITTER_EMAIL",
 ];
 
-pub async fn shell(session: &Session) -> anyhow::Result<()> {
+pub async fn shell(session: &Session, extra_env: &[(String, String)]) -> anyhow::Result<()> {
     let (mut send, mut recv) = session.open_bi().await?;
 
     // Open shell channel
@@ -63,15 +63,22 @@ pub async fn shell(session: &Session) -> anyhow::Result<()> {
         }
     }
 
+    for (key, val) in extra_env {
+        write_msg(
+            &mut send,
+            &Message::EnvSet {
+                key: key.clone(),
+                val: val.clone(),
+            },
+        )
+        .await?;
+    }
+
     // Request PTY
     let stdin_fd = std::io::stdin().as_raw_fd();
     let (cols, rows) = terminal_size(stdin_fd);
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
-    write_msg(
-        &mut send,
-        &Message::PtyRequest { term, cols, rows },
-    )
-    .await?;
+    write_msg(&mut send, &Message::PtyRequest { term, cols, rows }).await?;
 
     // Switch to raw mode
     let _raw = TermState::make_raw(stdin_fd)?;
@@ -86,10 +93,8 @@ pub async fn shell(session: &Session) -> anyhow::Result<()> {
             let mut buf = vec![0u8; 4096];
 
             #[cfg(unix)]
-            let mut sig_winch = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::window_change(),
-            )
-            .ok();
+            let mut sig_winch =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).ok();
 
             loop {
                 tokio::select! {

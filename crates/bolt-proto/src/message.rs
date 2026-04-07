@@ -28,7 +28,9 @@ pub enum Message {
         cert: Vec<u8>,
     },
     AuthSuccess,
-    AuthFailure { reason: String },
+    AuthFailure {
+        reason: String,
+    },
 
     // ── Channel open ──
     ChannelOpen {
@@ -36,18 +38,34 @@ pub enum Message {
         command: String,
     },
     ChannelAccept,
-    ChannelReject { reason: String },
+    ChannelReject {
+        reason: String,
+    },
 
     // ── Data ──
     Data(Vec<u8>),
     Eof,
 
     // ── Shell / PTY ──
-    EnvSet { key: String, val: String },
-    PtyRequest { term: String, cols: u32, rows: u32 },
-    WindowChange { cols: u32, rows: u32 },
-    Signal { name: String },
-    ExitStatus { code: i32 },
+    EnvSet {
+        key: String,
+        val: String,
+    },
+    PtyRequest {
+        term: String,
+        cols: u32,
+        rows: u32,
+    },
+    WindowChange {
+        cols: u32,
+        rows: u32,
+    },
+    Signal {
+        name: String,
+    },
+    ExitStatus {
+        code: i32,
+    },
 
     // ── Keepalive ──
     Ping,
@@ -62,47 +80,96 @@ pub enum Message {
         compress: bool,
     },
     FileChunk(Vec<u8>),
-    FileEnd { sha256: [u8; 32] },
+    FileEnd {
+        sha256: [u8; 32],
+    },
     FileAck,
-    FileFail { reason: String },
+    FileFail {
+        reason: String,
+    },
 
     // ── Transfer resume ──
-    ResumeRequest { path: String },
-    ResumeOffset { offset: u64 },
+    ResumeRequest {
+        path: String,
+    },
+    ResumeOffset {
+        offset: u64,
+    },
 
     // ── Delta sync ──
-    SyncRequest { name: String, size: u64, mode: u32 },
-    SyncSignature { signature: Vec<u8> },
+    SyncRequest {
+        name: String,
+        size: u64,
+        mode: u32,
+    },
+    SyncSignature {
+        signature: Vec<u8>,
+    },
     SyncNotFound,
-    SyncDelta { delta: Vec<u8> },
+    SyncDelta {
+        delta: Vec<u8>,
+    },
     SyncUpToDate,
 
     // ── Directory listing ──
-    DirList { path: String },
-    DirEntry { name: String, is_dir: bool, size: u64, mtime: u64, mode: u32 },
+    DirList {
+        path: String,
+    },
+    DirEntry {
+        name: String,
+        is_dir: bool,
+        size: u64,
+        mtime: u64,
+        mode: u32,
+    },
     DirEnd,
 
     // ── Local port forwarding ──
-    ForwardOpen { host: String, port: u16 },
+    ForwardOpen {
+        host: String,
+        port: u16,
+    },
     ForwardAccept,
-    ForwardReject { reason: String },
+    ForwardReject {
+        reason: String,
+    },
 
     // ── Remote port forwarding (-R) ──
     /// Client asks server to bind a TCP port; "0" = pick any free port.
-    RemoteForwardBind { bind_port: u16 },
+    RemoteForwardBind {
+        bind_port: u16,
+    },
     /// Server confirms and tells client which port was actually bound.
-    RemoteForwardBound { bound_port: u16 },
+    RemoteForwardBound {
+        bound_port: u16,
+    },
     /// Server notifies client of a new incoming connection on the bound port.
-    RemoteForwardIncoming { peer: String },
+    RemoteForwardIncoming {
+        peer: String,
+    },
     /// Server (or client) signals no more remote forward connections.
     RemoteForwardClose,
 
     // ── Filesystem (SFTP-like) ──
-    FsRename { from: String, to: String },
-    FsRemove { path: String, recursive: bool },
-    FsMkdir  { path: String, mode: u32 },
-    FsChmod  { path: String, mode: u32 },
-    FsStat   { path: String },
+    FsRename {
+        from: String,
+        to: String,
+    },
+    FsRemove {
+        path: String,
+        recursive: bool,
+    },
+    FsMkdir {
+        path: String,
+        mode: u32,
+    },
+    FsChmod {
+        path: String,
+        mode: u32,
+    },
+    FsStat {
+        path: String,
+    },
     FsStatResult {
         name: String,
         size: u64,
@@ -112,14 +179,18 @@ pub enum Message {
         is_symlink: bool,
     },
     FsOk,
-    FsFail { reason: String },
+    FsFail {
+        reason: String,
+    },
 
     // ── SSH agent forwarding ──
     /// Client requests that the server create a forwarded agent socket.
     AgentForwardRequest,
     AgentForwardAccept,
     /// Raw SSH agent protocol message (length-prefixed, direction: client→server or server→client).
-    AgentMessage { data: Vec<u8> },
+    AgentMessage {
+        data: Vec<u8>,
+    },
 }
 
 /// Channel types.
@@ -137,13 +208,13 @@ pub enum ChannelType {
 impl std::fmt::Display for ChannelType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Shell         => write!(f, "shell"),
-            Self::Exec          => write!(f, "exec"),
-            Self::Scp           => write!(f, "scp"),
-            Self::PortForward   => write!(f, "port-forward"),
+            Self::Shell => write!(f, "shell"),
+            Self::Exec => write!(f, "exec"),
+            Self::Scp => write!(f, "scp"),
+            Self::PortForward => write!(f, "port-forward"),
             Self::RemoteForward => write!(f, "remote-forward"),
-            Self::Fs            => write!(f, "fs"),
-            Self::AgentForward  => write!(f, "agent-forward"),
+            Self::Fs => write!(f, "fs"),
+            Self::AgentForward => write!(f, "agent-forward"),
         }
     }
 }

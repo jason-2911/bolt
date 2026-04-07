@@ -73,7 +73,11 @@ async fn handle_incoming(
     // Open a new QUIC stream to the client for this TCP connection
     let (mut send, mut recv) = conn.open_bi().await.context("open remote forward stream")?;
 
-    write_msg(&mut send, &Message::RemoteForwardIncoming { peer: peer.clone() }).await?;
+    write_msg(
+        &mut send,
+        &Message::RemoteForwardIncoming { peer: peer.clone() },
+    )
+    .await?;
 
     // Wait for client to accept
     match read_msg(&mut recv).await? {

@@ -23,6 +23,7 @@ toml       = { workspace = true }
 dirs       = { workspace = true }
 zstd       = { workspace = true }
 serde      = { workspace = true }
+minifb     = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }

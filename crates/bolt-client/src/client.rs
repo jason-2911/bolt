@@ -102,7 +102,9 @@ impl Client {
         info!(jump = %jump_addr, target = %addr, "connecting via jump host");
 
         // Step 1: Connect to bastion
-        let bastion = self.connect_direct(&jump_addr, jump_user).await
+        let bastion = self
+            .connect_direct(&jump_addr, jump_user)
+            .await
             .with_context(|| format!("connect to jump host {jump_addr}"))?;
 
         eprintln!("bolt: jump host {jump_addr} connected, tunneling to {addr}...");
@@ -139,30 +141,26 @@ impl Client {
         //
         // For now, we use the forward stream as a transparent byte tunnel
         // by opening a second QUIC connection over the stream pair adapter.
-        let conn = connect_quic_over_stream(
-            self,
-            fwd_send,
-            fwd_recv,
-            addr,
-            user,
-        )
-        .await
-        .with_context(|| format!("establish QUIC session to {addr} via jump host"))?;
+        let conn = connect_quic_over_stream(self, fwd_send, fwd_recv, addr, user)
+            .await
+            .with_context(|| format!("establish QUIC session to {addr} via jump host"))?;
 
         Ok(conn)
     }
 
     async fn connect_direct(&self, addr: &str, user: &str) -> anyhow::Result<Session> {
-        let remote: SocketAddr = addr.parse().with_context(|| format!("parse address: {addr}"))?;
+        let remote: SocketAddr = addr
+            .parse()
+            .with_context(|| format!("parse address: {addr}"))?;
 
         // Use file-backed session store for 0-RTT resumption
         let session_cache_path = dirs_home().join(".bolt/session_cache");
         let store = FileSessionStore::load(session_cache_path);
-        let client_config = tls::client_config_with_resume(store)
-            .context("build TLS client config")?;
+        let client_config =
+            tls::client_config_with_resume(store).context("build TLS client config")?;
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .context("bind client endpoint")?;
+        let mut endpoint =
+            Endpoint::client("0.0.0.0:0".parse().unwrap()).context("bind client endpoint")?;
         endpoint.set_default_client_config(client_config);
 
         let conn = endpoint
@@ -224,7 +222,9 @@ impl Client {
             user: user.to_owned(),
             public_key: self.identity.public,
         })?;
-        send.write_all(&auth_msg).await.context("send auth request")?;
+        send.write_all(&auth_msg)
+            .await
+            .context("send auth request")?;
         send.finish().context("finish auth send")?;
 
         let response = recv.read_to_end(4096).await.context("read auth response")?;
@@ -257,7 +257,9 @@ impl Client {
             user: user.to_owned(),
             password: password.to_owned(),
         })?;
-        send.write_all(&auth_msg).await.context("send password auth")?;
+        send.write_all(&auth_msg)
+            .await
+            .context("send password auth")?;
         send.finish().context("finish auth send")?;
 
         let response = recv.read_to_end(4096).await.context("read auth response")?;
@@ -281,7 +283,10 @@ impl Client {
 impl Session {
     /// Open a new bidirectional QUIC stream for a channel.
     pub async fn open_bi(&self) -> anyhow::Result<(quinn::SendStream, quinn::RecvStream)> {
-        self.conn.open_bi().await.context("open bidirectional stream")
+        self.conn
+            .open_bi()
+            .await
+            .context("open bidirectional stream")
     }
 }
 
@@ -308,8 +313,12 @@ async fn connect_quic_over_stream(
     use tokio::net::UdpSocket;
 
     // Two UDP sockets for proxying
-    let proxy_a = UdpSocket::bind("127.0.0.1:0").await.context("bind proxy_a")?;
-    let proxy_b = UdpSocket::bind("127.0.0.1:0").await.context("bind proxy_b")?;
+    let proxy_a = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .context("bind proxy_a")?;
+    let proxy_b = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .context("bind proxy_b")?;
     let addr_a = proxy_a.local_addr()?;
     let addr_b = proxy_b.local_addr()?;
 

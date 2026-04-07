@@ -26,7 +26,10 @@ pub async fn handle_exec(
             .env("LOGNAME", user)
             .env("SHELL", &shell)
             .env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("LANG", std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()))
+            .env(
+                "LANG",
+                std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()),
+            )
             .current_dir(&home)
             .pre_exec(move || {
                 libc::setgid(gid);

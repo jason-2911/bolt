@@ -78,6 +78,30 @@ bolt -p 2222 -i ~/.bolt/id_bolt user@host
 bolt -v user@host
 ```
 
+### UDP GUI Forwarding (`-X`)
+
+```bash
+# Server: just run boltd (built-in GUI UDP service is started automatically)
+boltd
+
+# Client: SSH-X style usage (auth + shell + GUI window forwarding)
+bolt -X -i ~/.bolt/id_bolt user@host
+
+# Optional: standalone GUI mode
+boltd gui --listen 0.0.0.0:5600 --source window
+bolt gui --listen 0.0.0.0:5601 --server <SERVER_IP>:5600
+```
+
+Notes:
+- Video path is one-way server→client over UDP chunks (no per-frame round-trip).
+- Input path is one-way client→server over UDP.
+- `bolt -X ...` does not force a window by itself. The desktop agent publishes attachable windows; the client opens its local window when inventory or streamed video arrives.
+- On Linux/X11, `boltd` must run inside the same X11 session as the GUI apps it launches, with valid `DISPLAY` and `XAUTHORITY`.
+- On Linux/X11, a desktop agent tracks new processes and windows, maps PID↔window, and publishes an inventory to the client.
+- On Linux/X11, the client selector uses `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End` to move and `Enter` to attach. `F6` detaches. `F7`/`F8` switch between known windows while attached.
+- On Linux/X11, input is injected into the attached target window via XTest (`libXtst`).
+- On macOS, server process needs Screen Recording permission to capture display.
+
 ### Jump Host (Bastion)
 
 ```bash

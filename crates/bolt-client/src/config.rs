@@ -204,8 +204,9 @@ pub fn parse_ssh_config_file(path: &Path) -> HashMap<String, HostEntry> {
                 }
             }
             // Start new block (may be multiple space-separated patterns)
-            current_hosts = val.split_whitespace()
-                .filter(|s| *s != "*")  // skip wildcard entries
+            current_hosts = val
+                .split_whitespace()
+                .filter(|s| *s != "*") // skip wildcard entries
                 .map(|s| s.to_owned())
                 .collect();
             current_entry = HostEntry::default();

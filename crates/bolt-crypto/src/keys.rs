@@ -59,8 +59,7 @@ impl KeyPair {
         }
 
         let priv_b64 = BASE64.encode(&self.der);
-        fs::write(path, format!("{priv_b64}\n"))
-            .map_err(|e| KeyError::Io(path.to_owned(), e))?;
+        fs::write(path, format!("{priv_b64}\n")).map_err(|e| KeyError::Io(path.to_owned(), e))?;
 
         #[cfg(unix)]
         {
@@ -70,8 +69,7 @@ impl KeyPair {
 
         let pub_path = path.with_extension("pub");
         let pub_b64 = BASE64.encode(self.public);
-        fs::write(&pub_path, format!("{pub_b64}\n"))
-            .map_err(|e| KeyError::Io(pub_path, e))?;
+        fs::write(&pub_path, format!("{pub_b64}\n")).map_err(|e| KeyError::Io(pub_path, e))?;
         Ok(())
     }
 

@@ -10,13 +10,8 @@ use bolt_crypto::auth::Authenticator;
 use bolt_proto::{read_msg, write_msg, ChannelType, Message};
 
 use crate::{
-    agent::handle_agent_forward,
-    exec::handle_exec,
-    forward::handle_forward,
-    fs::handle_fs,
-    remote_forward::handle_remote_forward,
-    shell::handle_shell,
-    transfer::handle_transfer,
+    agent::handle_agent_forward, exec::handle_exec, forward::handle_forward, fs::handle_fs,
+    remote_forward::handle_remote_forward, shell::handle_shell, transfer::handle_transfer,
 };
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -32,10 +27,7 @@ pub async fn handle_connection(
     info!(remote = %remote, "new connection");
 
     // ── Auth handshake (first bidirectional stream) ────────────────────────
-    let (mut auth_send, mut auth_recv) = conn
-        .accept_bi()
-        .await
-        .context("accept auth stream")?;
+    let (mut auth_send, mut auth_recv) = conn.accept_bi().await.context("accept auth stream")?;
 
     let Some(msg) = read_msg(&mut auth_recv).await? else {
         anyhow::bail!("client closed before auth");
@@ -47,8 +39,14 @@ pub async fn handle_connection(
             if let Some(ref auth) = auth {
                 if let Err(e) = auth.authenticate(&public_key) {
                     warn!(remote = %remote, user = %user, error = %e, "key auth failed");
-                    write_msg(&mut auth_send, &Message::AuthFailure { reason: e.to_string() })
-                        .await.ok();
+                    write_msg(
+                        &mut auth_send,
+                        &Message::AuthFailure {
+                            reason: e.to_string(),
+                        },
+                    )
+                    .await
+                    .ok();
                     auth_send.finish().ok();
                     return Ok(());
                 }
@@ -60,7 +58,9 @@ pub async fn handle_connection(
             // Password auth — validate via PAM or simple check
             if let Err(reason) = verify_password(&user, &password) {
                 warn!(remote = %remote, user = %user, "password auth failed");
-                write_msg(&mut auth_send, &Message::AuthFailure { reason }).await.ok();
+                write_msg(&mut auth_send, &Message::AuthFailure { reason })
+                    .await
+                    .ok();
                 auth_send.finish().ok();
                 return Ok(());
             }
@@ -76,8 +76,14 @@ pub async fn handle_connection(
                 }
                 Err(e) => {
                     warn!(remote = %remote, error = %e, "cert auth failed");
-                    write_msg(&mut auth_send, &Message::AuthFailure { reason: e.to_string() })
-                        .await.ok();
+                    write_msg(
+                        &mut auth_send,
+                        &Message::AuthFailure {
+                            reason: e.to_string(),
+                        },
+                    )
+                    .await
+                    .ok();
                     auth_send.finish().ok();
                     return Ok(());
                 }
@@ -263,8 +269,8 @@ fn verify_password_pam(user: &str, password: &str) -> Result<(), String> {
     // On macOS, PAM would be needed; we return an error for now.
     #[cfg(target_os = "linux")]
     {
-        use std::ffi::CString;
         use nix::libc;
+        use std::ffi::CString;
 
         let c_user = CString::new(user).map_err(|e| e.to_string())?;
         let sp = unsafe { libc::getspnam(c_user.as_ptr()) };
@@ -287,8 +293,8 @@ fn verify_password_pam(user: &str, password: &str) -> Result<(), String> {
 
 #[cfg(all(unix, target_os = "linux"))]
 fn verify_password_passwd(user: &str, password: &str) -> Result<(), String> {
-    use std::ffi::CString;
     use nix::libc;
+    use std::ffi::CString;
 
     let c_user = CString::new(user).map_err(|e| e.to_string())?;
     let pw = unsafe { libc::getpwnam(c_user.as_ptr()) };
@@ -304,8 +310,8 @@ fn verify_password_passwd(user: &str, password: &str) -> Result<(), String> {
 
 #[cfg(all(unix, target_os = "linux"))]
 fn verify_crypt(password: &str, hash: &str) -> Result<(), String> {
-    use std::ffi::CString;
     use nix::libc;
+    use std::ffi::CString;
 
     let c_pw = CString::new(password).map_err(|e| e.to_string())?;
     let c_hash = CString::new(hash).map_err(|e| e.to_string())?;

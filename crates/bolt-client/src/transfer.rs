@@ -1,9 +1,6 @@
 //! Client file transfer: rsync delta sync, resume, zstd compression, timestamp preservation.
 
-use std::{
-    path::Path,
-    time::UNIX_EPOCH,
-};
+use std::{path::Path, time::UNIX_EPOCH};
 
 use anyhow::{bail, Context as _};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -72,17 +69,22 @@ pub async fn upload_opts(
         bail!("connection closed during sync handshake");
     };
 
-    let file_name = local
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let file_name = local.file_name().unwrap_or_default().to_string_lossy();
 
     match msg {
         Message::SyncSignature { signature } => {
             upload_delta(&mut send, &mut recv, &local_data, &signature, &file_name).await
         }
         Message::SyncNotFound => {
-            upload_full(&mut send, &mut recv, &local_data, &file_name, file_size, mtime).await
+            upload_full(
+                &mut send,
+                &mut recv,
+                &local_data,
+                &file_name,
+                file_size,
+                mtime,
+            )
+            .await
         }
         Message::FileFail { reason } => bail!("server error: {reason}"),
         other => bail!("unexpected sync response: {other:?}"),
@@ -123,7 +125,13 @@ async fn upload_delta(
     while offset < delta.len() {
         let end = (offset + CHUNK).min(delta.len());
         let chunk = &delta[offset..end];
-        write_msg(send, &Message::SyncDelta { delta: chunk.to_vec() }).await?;
+        write_msg(
+            send,
+            &Message::SyncDelta {
+                delta: chunk.to_vec(),
+            },
+        )
+        .await?;
         pb.inc(chunk.len() as u64);
         offset = end;
     }
@@ -182,7 +190,11 @@ async fn upload_full(
 
     let sha256: [u8; 32] = hasher.finalize().into();
     write_msg(send, &Message::FileEnd { sha256 }).await?;
-    pb.finish_with_message(if compress { "done (compressed)" } else { "done (full)" });
+    pb.finish_with_message(if compress {
+        "done (compressed)"
+    } else {
+        "done (full)"
+    });
 
     expect_ack(recv).await
 }
@@ -190,11 +202,7 @@ async fn upload_full(
 // ── Upload with resume ────────────────────────────────────────────────────
 
 /// Upload a large file with resume support (skips already-uploaded bytes).
-pub async fn upload_resume(
-    session: &Session,
-    local: &Path,
-    remote: &str,
-) -> anyhow::Result<()> {
+pub async fn upload_resume(session: &Session, local: &Path, remote: &str) -> anyhow::Result<()> {
     let local_data = fs::read(local)
         .await
         .with_context(|| format!("read {}", local.display()))?;
@@ -212,7 +220,13 @@ pub async fn upload_resume(
     expect_accept(&mut recv).await?;
 
     // Ask server how many bytes it already has
-    write_msg(&mut send, &Message::ResumeRequest { path: remote.to_owned() }).await?;
+    write_msg(
+        &mut send,
+        &Message::ResumeRequest {
+            path: remote.to_owned(),
+        },
+    )
+    .await?;
     let offset = match read_msg(&mut recv).await? {
         Some(Message::ResumeOffset { offset }) => offset as usize,
         _ => 0,
@@ -316,17 +330,32 @@ pub async fn download_opts(
     let out_path = resolve_download_path(local, remote);
 
     match msg {
-        Message::FileHeader { name, size, mtime, compress, .. } => {
-            download_full(&mut send, &mut recv, &out_path, &name, size, mtime, compress, preserve).await
+        Message::FileHeader {
+            name,
+            size,
+            mtime,
+            compress,
+            ..
+        } => {
+            download_full(
+                &mut send, &mut recv, &out_path, &name, size, mtime, compress, preserve,
+            )
+            .await
         }
         Message::SyncDelta { delta } => {
             let ld = local_data.context("local file disappeared")?;
-            download_delta(&mut send, &mut recv, &out_path, &ld, delta, remote, preserve).await
+            download_delta(
+                &mut send, &mut recv, &out_path, &ld, delta, remote, preserve,
+            )
+            .await
         }
         Message::SyncUpToDate => {
             eprintln!(
                 "{}: up to date",
-                Path::new(remote).file_name().unwrap_or_default().to_string_lossy()
+                Path::new(remote)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
             );
             Ok(())
         }
@@ -373,7 +402,9 @@ async fn download_full(
                 } else {
                     data
                 };
-                tokio::io::AsyncWriteExt::write_all(&mut out, &data).await.context("write")?;
+                tokio::io::AsyncWriteExt::write_all(&mut out, &data)
+                    .await
+                    .context("write")?;
                 hasher.update(&data);
                 pb.inc(data.len() as u64);
             }
@@ -431,8 +462,7 @@ async fn download_delta(
             }
             Message::FileEnd { sha256 } => {
                 let mut result = Vec::new();
-                fast_rsync::apply(local_data, &full_delta, &mut result)
-                    .context("apply delta")?;
+                fast_rsync::apply(local_data, &full_delta, &mut result).context("apply delta")?;
 
                 let computed: [u8; 32] = Sha256::digest(&result).into();
                 if computed != sha256 {
@@ -479,7 +509,13 @@ pub async fn list_dir(session: &Session, remote_path: &str) -> anyhow::Result<Ve
     .await?;
     expect_accept(&mut recv).await?;
 
-    write_msg(&mut send, &Message::DirList { path: remote_path.to_owned() }).await?;
+    write_msg(
+        &mut send,
+        &Message::DirList {
+            path: remote_path.to_owned(),
+        },
+    )
+    .await?;
 
     let mut entries = Vec::new();
     loop {
@@ -487,8 +523,20 @@ pub async fn list_dir(session: &Session, remote_path: &str) -> anyhow::Result<Ve
             bail!("connection closed during dir list");
         };
         match msg {
-            Message::DirEntry { name, is_dir, size, mtime, mode } => {
-                entries.push(RemoteDirEntry { name, is_dir, size, mtime, mode });
+            Message::DirEntry {
+                name,
+                is_dir,
+                size,
+                mtime,
+                mode,
+            } => {
+                entries.push(RemoteDirEntry {
+                    name,
+                    is_dir,
+                    size,
+                    mtime,
+                    mode,
+                });
             }
             Message::DirEnd => break,
             Message::FileFail { reason } => bail!("dir list error: {reason}"),
@@ -562,8 +610,14 @@ fn set_mtime(path: &Path, mtime_secs: u64) {
 
         if let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) {
             let times = [
-                libc::timespec { tv_sec: mtime_secs as i64, tv_nsec: 0 },
-                libc::timespec { tv_sec: mtime_secs as i64, tv_nsec: 0 },
+                libc::timespec {
+                    tv_sec: mtime_secs as i64,
+                    tv_nsec: 0,
+                },
+                libc::timespec {
+                    tv_sec: mtime_secs as i64,
+                    tv_nsec: 0,
+                },
             ];
             unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
         }

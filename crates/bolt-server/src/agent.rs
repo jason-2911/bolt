@@ -56,21 +56,28 @@ pub async fn handle_agent_forward(
                 }
                 let len = u32::from_be_bytes(len_buf) as usize;
                 let mut body = vec![0u8; len];
-                if unix_conn.read_exact(&mut body).await.is_err() { break; }
+                if unix_conn.read_exact(&mut body).await.is_err() {
+                    break;
+                }
 
                 let mut req_data = Vec::with_capacity(4 + len);
                 req_data.extend_from_slice(&len_buf);
                 req_data.extend_from_slice(&body);
 
                 // Send to client
-                if write_msg(send, &Message::AgentMessage { data: req_data }).await.is_err() {
+                if write_msg(send, &Message::AgentMessage { data: req_data })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
 
                 // Get response from client
                 match read_msg(recv).await {
                     Ok(Some(Message::AgentMessage { data })) => {
-                        if unix_conn.write_all(&data).await.is_err() { break; }
+                        if unix_conn.write_all(&data).await.is_err() {
+                            break;
+                        }
                     }
                     _ => break,
                 }

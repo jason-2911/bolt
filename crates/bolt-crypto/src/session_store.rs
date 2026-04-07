@@ -26,7 +26,7 @@ use rustls::{
 struct Inner {
     tls13: HashMap<String, Tls13ClientSessionValue>,
     tls12: HashMap<String, Tls12ClientSessionValue>,
-    kx:    HashMap<String, NamedGroup>,
+    kx: HashMap<String, NamedGroup>,
 }
 
 /// Session store that keeps sessions in memory.
@@ -34,7 +34,7 @@ struct Inner {
 /// File persistence for TLS 1.3 tickets is attempted on each insert/take
 /// using bincode serialization of the raw session bytes.
 pub struct FileSessionStore {
-    path:  PathBuf,
+    path: PathBuf,
     inner: Mutex<Inner>,
 }
 
@@ -55,7 +55,7 @@ impl FileSessionStore {
             inner: Mutex::new(Inner {
                 tls13: HashMap::new(),
                 tls12: HashMap::new(),
-                kx:    HashMap::new(),
+                kx: HashMap::new(),
             }),
         })
     }

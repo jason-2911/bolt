@@ -101,7 +101,9 @@ pub async fn run_remote_forward(session: &Session, fwd: RemoteForward) -> anyhow
 
     // Keep control stream open until Ctrl+C
     tokio::signal::ctrl_c().await.ok();
-    write_msg(&mut ctrl_send, &Message::RemoteForwardClose).await.ok();
+    write_msg(&mut ctrl_send, &Message::RemoteForwardClose)
+        .await
+        .ok();
     forward_task.abort();
 
     Ok(())

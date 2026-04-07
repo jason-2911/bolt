@@ -91,3 +91,7 @@ clap_complete = "4"
 
 # Compression
 zstd = "0.13"
+
+# GUI window + image decode for UDP GUI streaming
+minifb = "0.27"
+image = { version = "0.25", default-features = true, features = ["png"] }

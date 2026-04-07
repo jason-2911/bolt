@@ -35,19 +35,17 @@ use tracing::Level;
 use bolt_client::{
     agent::request_agent_forward,
     client::{Client, ClientConfig},
-    config::{BoltConfig, parse_ssh_config},
+    config::{parse_ssh_config, BoltConfig},
     exec::exec,
     forward::{run_local_forward, LocalForward},
     fs::{fs_chmod, fs_ls, fs_mkdir, fs_remove, fs_rename, fs_stat},
+    gui_stream::{run_gui_client, GuiClientConfig},
     remote_forward::{run_remote_forward, RemoteForward},
     shell::shell,
     transfer::{download_opts, upload_opts},
     transfer_dir::{download_dir_opts, upload_dir_opts},
 };
-use bolt_crypto::{
-    ca::BoltCert,
-    keys::KeyPair,
-};
+use bolt_crypto::{ca::BoltCert, keys::KeyPair};
 use bolt_log::{init as log_init, Config as LogConfig};
 
 // ── CLI ───────────────────────────────────────────────────────────────────
@@ -56,7 +54,7 @@ use bolt_log::{init as log_init, Config as LogConfig};
 #[command(
     name = "bolt",
     about = "Bolt — Lightning-fast secure remote shell",
-    version,
+    version
 )]
 struct Args {
     /// Identity (private key) file
@@ -87,12 +85,30 @@ struct Args {
     #[arg(long, global = true)]
     agent: bool,
 
+    /// Enable GUI forwarding window (X-like over UDP stream)
+    #[arg(short = 'X', long, global = true)]
+    x11: bool,
+
     #[command(subcommand)]
     command: Cmd,
 }
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// UDP GUI streaming client (video receive + input send)
+    #[command(name = "gui")]
+    Gui {
+        /// Local UDP listen address (client side)
+        #[arg(long, default_value = "0.0.0.0:5601")]
+        listen: String,
+        /// Server UDP address
+        #[arg(long, default_value = "127.0.0.1:5600")]
+        server: String,
+        /// GUI session token used to bind this GUI client to a remote shell
+        #[arg(long, default_value = "")]
+        token: String,
+    },
+
     /// Copy files/directories: bolt cp [-r] [-p] <src> <dest>
     #[command(name = "cp")]
     Cp {
@@ -129,9 +145,7 @@ enum Cmd {
 
     /// Print shell completion script: bolt completions <bash|zsh|fish|powershell|elvish>
     #[command(name = "completions")]
-    Completions {
-        shell: Shell,
-    },
+    Completions { shell: Shell },
 
     /// Catch-all: bolt [user@host] [-c command]
     #[command(external_subcommand)]
@@ -221,20 +235,41 @@ async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
 
     log_init(LogConfig {
-        level: if args.verbose { Level::DEBUG } else { Level::WARN },
+        level: if args.verbose {
+            Level::DEBUG
+        } else {
+            Level::WARN
+        },
         format: bolt_log::Format::Text,
     });
 
     match args.command {
+        Cmd::Gui {
+            ref listen,
+            ref server,
+            ref token,
+        } => run_gui(listen, server, token).await,
         Cmd::Keygen { ref output } => run_keygen(output.as_deref()),
         Cmd::Completions { shell } => run_completions(shell),
-        Cmd::Cp { ref source, ref dest, recursive, preserve } => {
-            run_copy(&args, source, dest, recursive, preserve).await
-        }
+        Cmd::Cp {
+            ref source,
+            ref dest,
+            recursive,
+            preserve,
+        } => run_copy(&args, source, dest, recursive, preserve).await,
         Cmd::Fs { ref op } => run_fs(&args, op).await,
         Cmd::Ca { ref op } => run_ca(op),
         Cmd::Remote(ref remote_args) => run_remote(&args, remote_args).await,
     }
+}
+
+async fn run_gui(listen: &str, server: &str, token: &str) -> anyhow::Result<()> {
+    run_gui_client(GuiClientConfig {
+        listen_addr: listen.to_owned(),
+        server_addr: server.to_owned(),
+        token: token.to_owned(),
+    })
+    .await
 }
 
 // ── bolt user@host [-c command] [-L ...] [-R ...] [--agent] ──────────────
@@ -260,6 +295,39 @@ async fn run_remote(args: &Args, remote_args: &[OsString]) -> anyhow::Result<()>
             .await?
     } else {
         client.connect(&resolved.addr(), &resolved.user).await?
+    };
+
+    let gui_token = if args.x11 {
+        Some(format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    } else {
+        None
+    };
+
+    let mut gui_child = if let Some(gui_token) = gui_token.as_ref() {
+        let gui_server = format!("{}:5600", resolved.host);
+        eprintln!("bolt: GUI forwarding enabled -> {gui_server}");
+        let exe = std::env::current_exe().context("resolve current bolt executable")?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("gui")
+            .arg("--listen")
+            .arg("0.0.0.0:5601")
+            .arg("--server")
+            .arg(gui_server)
+            .arg("--token")
+            .arg(gui_token);
+        if args.verbose {
+            cmd.arg("-v");
+        }
+        Some(cmd.spawn().context("spawn GUI forwarding process")?)
+    } else {
+        None
     };
 
     // SSH agent forwarding
@@ -320,7 +388,17 @@ async fn run_remote(args: &Args, remote_args: &[OsString]) -> anyhow::Result<()>
             let code = exec(&session, &cmd).await?;
             process::exit(code);
         }
-        None => shell(&session).await,
+        None => {
+            let extra_env = gui_token
+                .as_ref()
+                .map(|token| vec![("BOLT_GUI_TOKEN".to_string(), token.clone())])
+                .unwrap_or_default();
+            let res = shell(&session, &extra_env).await;
+            if let Some(child) = gui_child.as_mut() {
+                let _ = child.kill();
+            }
+            res
+        }
     }
 }
 
@@ -341,7 +419,10 @@ fn parse_remote_command(args: &[OsString]) -> anyhow::Result<Option<String>> {
         }
     }
 
-    let unknown: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    let unknown: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     bail!(
         "unknown arguments: {}. Use -c to run a command: bolt user@host -c \"command\"",
         unknown.join(" ")
@@ -419,9 +500,8 @@ async fn run_fs(args: &Args, op: &FsOp) -> anyhow::Result<()> {
         FsOp::Mv { from, to } => {
             // Both must be on the same host (parsed from `from`)
             let (user, host, from_path) = parse_remote_path(from)?;
-            let (_, _, to_path) = parse_remote_path(to).unwrap_or_else(|_| {
-                (user.clone(), host.clone(), to.clone())
-            });
+            let (_, _, to_path) =
+                parse_remote_path(to).unwrap_or_else(|_| (user.clone(), host.clone(), to.clone()));
             let session = connect_for_host(args, &cfg, &user, &host).await?;
             fs_rename(&session, &from_path, &to_path).await
         }
@@ -465,9 +545,7 @@ fn run_ca(op: &CaOp) -> anyhow::Result<()> {
 
     match op {
         CaOp::Init { output } => {
-            let key_path = output
-                .clone()
-                .unwrap_or_else(|| home.join(".bolt/ca_key"));
+            let key_path = output.clone().unwrap_or_else(|| home.join(".bolt/ca_key"));
             let ca = KeyPair::generate().context("generate CA keypair")?;
             ca.save(&key_path).context("save CA key")?;
 
@@ -476,15 +554,22 @@ fn run_ca(op: &CaOp) -> anyhow::Result<()> {
             eprintln!("Fingerprint:     {}", ca.fingerprint());
             eprintln!();
             eprintln!("Add the CA public key to boltd's trusted keys:");
-            eprintln!("  echo $(cat {}.pub) >> ~/.bolt/ca_keys", key_path.display());
+            eprintln!(
+                "  echo $(cat {}.pub) >> ~/.bolt/ca_keys",
+                key_path.display()
+            );
 
             Ok(())
         }
 
-        CaOp::Sign { user, pubkey, days, ca_key, output } => {
-            let ca_key_path = ca_key
-                .clone()
-                .unwrap_or_else(|| home.join(".bolt/ca_key"));
+        CaOp::Sign {
+            user,
+            pubkey,
+            days,
+            ca_key,
+            output,
+        } => {
+            let ca_key_path = ca_key.clone().unwrap_or_else(|| home.join(".bolt/ca_key"));
 
             let ca = KeyPair::load(&ca_key_path)
                 .with_context(|| format!("load CA key: {}", ca_key_path.display()))?;
@@ -494,8 +579,8 @@ fn run_ca(op: &CaOp) -> anyhow::Result<()> {
                 .with_context(|| format!("read pubkey: {}", pubkey.display()))?;
             let user_public_key = parse_public_key(&pubkey_bytes)?;
 
-            let cert = BoltCert::sign(user, user_public_key, *days, &ca)
-                .context("sign certificate")?;
+            let cert =
+                BoltCert::sign(user, user_public_key, *days, &ca).context("sign certificate")?;
 
             let cert_path = output
                 .clone()
@@ -521,11 +606,8 @@ fn parse_public_key(bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
     }
     // Try base64 (with or without trailing newline)
     let trimmed = std::str::from_utf8(bytes)?.trim();
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        trimmed,
-    )
-    .context("decode public key as base64")?;
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, trimmed)
+        .context("decode public key as base64")?;
     if decoded.len() != 32 {
         bail!("public key must be 32 bytes (got {})", decoded.len());
     }
@@ -563,10 +645,7 @@ fn run_completions(shell: Shell) -> anyhow::Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn make_client(
-    args: &Args,
-    config_identity: &Option<PathBuf>,
-) -> anyhow::Result<Client> {
+fn make_client(args: &Args, config_identity: &Option<PathBuf>) -> anyhow::Result<Client> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let identity_file = args
         .identity

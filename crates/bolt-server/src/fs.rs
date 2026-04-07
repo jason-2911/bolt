@@ -3,10 +3,7 @@
 //! Handles a stream of FsXxx messages until EOF.
 //! Each request gets either FsOk / FsStatResult or FsFail.
 
-use std::{
-    os::unix::fs::PermissionsExt,
-    path::Path,
-};
+use std::{os::unix::fs::PermissionsExt, path::Path};
 
 use anyhow::Context as _;
 use tokio::fs;
@@ -25,12 +22,12 @@ pub async fn handle_fs(
         };
 
         let result = match msg {
-            Message::FsStat   { path }               => fs_stat(&path).await,
-            Message::FsRename { from, to }           => fs_rename(&from, &to).await,
-            Message::FsRemove { path, recursive }    => fs_remove(&path, recursive).await,
-            Message::FsMkdir  { path, mode }         => fs_mkdir(&path, mode).await,
-            Message::FsChmod  { path, mode }         => fs_chmod(&path, mode).await,
-            Message::DirList  { path }               => {
+            Message::FsStat { path } => fs_stat(&path).await,
+            Message::FsRename { from, to } => fs_rename(&from, &to).await,
+            Message::FsRemove { path, recursive } => fs_remove(&path, recursive).await,
+            Message::FsMkdir { path, mode } => fs_mkdir(&path, mode).await,
+            Message::FsChmod { path, mode } => fs_chmod(&path, mode).await,
+            Message::DirList { path } => {
                 // Delegate to transfer's dir list logic inline
                 return handle_dir_stream(send, recv, &path).await;
             }
@@ -39,7 +36,15 @@ pub async fn handle_fs(
 
         match result {
             Ok(reply) => write_msg(send, &reply).await?,
-            Err(e)    => write_msg(send, &Message::FsFail { reason: e.to_string() }).await?,
+            Err(e) => {
+                write_msg(
+                    send,
+                    &Message::FsFail {
+                        reason: e.to_string(),
+                    },
+                )
+                .await?
+            }
         }
     }
     Ok(())
@@ -95,15 +100,23 @@ async fn fs_rename(from: &str, to: &str) -> anyhow::Result<Message> {
 }
 
 async fn fs_remove(path: &str, recursive: bool) -> anyhow::Result<Message> {
-    let meta = fs::metadata(path).await.with_context(|| format!("stat {path}"))?;
+    let meta = fs::metadata(path)
+        .await
+        .with_context(|| format!("stat {path}"))?;
     if meta.is_dir() {
         if recursive {
-            fs::remove_dir_all(path).await.with_context(|| format!("rmdir -r {path}"))?;
+            fs::remove_dir_all(path)
+                .await
+                .with_context(|| format!("rmdir -r {path}"))?;
         } else {
-            fs::remove_dir(path).await.with_context(|| format!("rmdir {path}"))?;
+            fs::remove_dir(path)
+                .await
+                .with_context(|| format!("rmdir {path}"))?;
         }
     } else {
-        fs::remove_file(path).await.with_context(|| format!("rm {path}"))?;
+        fs::remove_file(path)
+            .await
+            .with_context(|| format!("rm {path}"))?;
     }
     debug!(path, recursive, "remove");
     Ok(Message::FsOk)
@@ -116,8 +129,8 @@ async fn fs_mkdir(path: &str, mode: u32) -> anyhow::Result<Message> {
 
     #[cfg(unix)]
     {
-        use std::ffi::CString;
         use nix::libc;
+        use std::ffi::CString;
         if let Ok(c) = CString::new(path) {
             unsafe { libc::chmod(c.as_ptr(), mode as libc::mode_t) };
         }
@@ -130,8 +143,8 @@ async fn fs_mkdir(path: &str, mode: u32) -> anyhow::Result<Message> {
 async fn fs_chmod(path: &str, mode: u32) -> anyhow::Result<Message> {
     #[cfg(unix)]
     {
-        use std::ffi::CString;
         use nix::libc;
+        use std::ffi::CString;
         let c = CString::new(path).context("invalid path")?;
         let ret = unsafe { libc::chmod(c.as_ptr(), mode as libc::mode_t) };
         if ret != 0 {
@@ -155,7 +168,14 @@ async fn handle_dir_stream(
     let mut rd = match fs::read_dir(path).await {
         Ok(rd) => rd,
         Err(e) => {
-            write_msg(send, &Message::FsFail { reason: e.to_string() }).await.ok();
+            write_msg(
+                send,
+                &Message::FsFail {
+                    reason: e.to_string(),
+                },
+            )
+            .await
+            .ok();
             return Ok(());
         }
     };
@@ -165,7 +185,14 @@ async fn handle_dir_stream(
             Ok(Some(e)) => e,
             Ok(None) => break,
             Err(e) => {
-                write_msg(send, &Message::FsFail { reason: e.to_string() }).await.ok();
+                write_msg(
+                    send,
+                    &Message::FsFail {
+                        reason: e.to_string(),
+                    },
+                )
+                .await
+                .ok();
                 return Ok(());
             }
         };

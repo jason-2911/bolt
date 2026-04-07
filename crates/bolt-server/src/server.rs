@@ -113,11 +113,10 @@ impl Server {
             info!("using systemd-provided socket");
             ep
         } else {
-            let addr: SocketAddr = self
-                .config
-                .listen_addr
-                .parse()
-                .with_context(|| format!("parse listen address: {}", self.config.listen_addr))?;
+            let addr: SocketAddr =
+                self.config.listen_addr.parse().with_context(|| {
+                    format!("parse listen address: {}", self.config.listen_addr)
+                })?;
             Endpoint::server(server_config, addr)
                 .with_context(|| format!("bind {}", self.config.listen_addr))?
         };

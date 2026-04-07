@@ -88,7 +88,8 @@ impl BoltCert {
         if self.username != expected_user {
             anyhow::bail!(
                 "cert username '{}' does not match auth user '{}'",
-                self.username, expected_user
+                self.username,
+                expected_user
             );
         }
 
@@ -148,11 +149,8 @@ pub fn load_ca_keys(path: &Path) -> anyhow::Result<Vec<[u8; 32]>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            line,
-        )
-        .context("decode CA public key")?;
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, line)
+            .context("decode CA public key")?;
         if bytes.len() != 32 {
             anyhow::bail!("CA public key must be 32 bytes");
         }

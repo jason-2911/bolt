@@ -46,6 +46,7 @@ pub fn is_safe_env_key(key: &str) -> bool {
             | "GIT_COMMITTER_EMAIL"
             | "CARGO_HOME"
             | "RUSTUP_HOME"
+            | "BOLT_GUI_TOKEN"
     )
 }
 
@@ -55,6 +56,9 @@ pub fn is_safe_env_key(key: &str) -> bool {
 mod unix {
     use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
     use std::process::Stdio;
+
+    #[cfg(target_os = "macos")]
+    use std::fs;
 
     use anyhow::Context as _;
     use nix::{
@@ -104,6 +108,18 @@ mod unix {
         let (shell_path, home_dir, uid, gid) = resolve_user(user)?;
         debug!(user, shell = %shell_path, home = %home_dir, uid, gid, "resolved user");
 
+        let gui_token = extra_env
+            .iter()
+            .find(|(k, _)| k == "BOLT_GUI_TOKEN")
+            .map(|(_, v)| v.clone());
+        let base_path = server_base_path();
+        let gui_wrapper_dir = setup_gui_wrappers(gui_token.as_deref())?;
+        let shell_path_env = if let Some(dir) = gui_wrapper_dir.as_deref() {
+            format!("{}:{base_path}", dir.display())
+        } else {
+            base_path.clone()
+        };
+
         let slave_stdin = slave_fd;
         let slave_stdout = unsafe { libc::dup(slave_fd) };
         let slave_stderr = unsafe { libc::dup(slave_fd) };
@@ -116,20 +132,25 @@ mod unix {
             .env("USER", user)
             .env("LOGNAME", user)
             .env("SHELL", &shell_path)
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("PATH", &shell_path_env)
             .env(
                 "LANG",
                 std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()),
             )
             .current_dir(&home_dir);
 
+        populate_server_gui_env(&mut cmd);
+
         for (k, v) in &extra_env {
             cmd.env(k, v);
         }
+        if gui_wrapper_dir.is_some() {
+            cmd.env("BOLT_ORIG_PATH", base_path)
+                .env("BOLT_GUI_CLAIM_DIR", gui_claim_dir().display().to_string());
+        }
 
         let mut child = unsafe {
-            cmd
-                .stdin(Stdio::from_raw_fd(slave_stdin))
+            cmd.stdin(Stdio::from_raw_fd(slave_stdin))
                 .stdout(Stdio::from_raw_fd(slave_stdout))
                 .stderr(Stdio::from_raw_fd(slave_stderr))
                 .pre_exec(move || {
@@ -279,6 +300,136 @@ mod unix {
 
         Ok((shell, home, pw.pw_uid, pw.pw_gid))
     }
+
+    fn gui_claim_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp/bolt-gui-claims")
+    }
+
+    fn server_base_path() -> String {
+        std::env::var("PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string())
+    }
+
+    fn populate_server_gui_env(cmd: &mut Command) {
+        #[cfg(target_os = "linux")]
+        for key in [
+            "DISPLAY",
+            "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "XDG_SESSION_TYPE",
+            "DESKTOP_SESSION",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.is_empty() {
+                    cmd.env(key, value);
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        let _ = cmd;
+    }
+
+    fn setup_gui_wrappers(gui_token: Option<&str>) -> anyhow::Result<Option<std::path::PathBuf>> {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(gui_token) = gui_token else {
+                return Ok(None);
+            };
+
+            let claim_dir = gui_claim_dir();
+            fs::create_dir_all(&claim_dir).context("create GUI claim dir")?;
+
+            let wrapper_dir =
+                std::path::PathBuf::from(format!("/tmp/bolt-gui-wrapper-{gui_token}"));
+            fs::create_dir_all(&wrapper_dir).context("create GUI wrapper dir")?;
+
+            write_wrapper(
+                &wrapper_dir.join("bolt-gui-claim"),
+                r#"#!/bin/sh
+set -eu
+token=${BOLT_GUI_TOKEN:?}
+claim_dir=${BOLT_GUI_CLAIM_DIR:?}
+owner=${1:?}
+pid=${2:-}
+mkdir -p "$claim_dir"
+tmp="$claim_dir/$token.tmp"
+{
+  printf 'owner=%s\n' "$owner"
+  if [ -n "$pid" ]; then
+    printf 'pid=%s\n' "$pid"
+  fi
+  printf 'updated=%s\n' "$(/bin/date +%s)"
+} > "$tmp"
+/bin/mv "$tmp" "$claim_dir/$token"
+"#,
+            )?;
+
+            write_wrapper(
+                &wrapper_dir.join("code"),
+                r#"#!/bin/sh
+set -eu
+PATH=${BOLT_ORIG_PATH:?}
+/usr/bin/open -na "Visual Studio Code" --args "$@"
+/bin/sleep 1
+pid=$(/usr/bin/pgrep -nx Code || true)
+"$(dirname "$0")/bolt-gui-claim" "Code" "$pid"
+"#,
+            )?;
+
+            write_wrapper(
+                &wrapper_dir.join("open"),
+                r#"#!/bin/sh
+set -eu
+PATH=${BOLT_ORIG_PATH:?}
+if [ "${1:-}" = "-a" ] && [ -n "${2:-}" ]; then
+  app="$2"
+  shift 2
+  /usr/bin/open -na "$app" "$@"
+  /bin/sleep 1
+  case "$app" in
+    "Google Chrome") proc_name="Google Chrome" ;;
+    "Visual Studio Code") proc_name="Code" ;;
+    "Cursor") proc_name="Cursor" ;;
+    *) proc_name="$app" ;;
+  esac
+  pid=$(/usr/bin/pgrep -nx "$proc_name" || true)
+  "$(dirname "$0")/bolt-gui-claim" "$proc_name" "$pid"
+  exit 0
+fi
+/usr/bin/open "$@"
+"#,
+            )?;
+
+            Ok(Some(wrapper_dir))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = gui_token;
+            Ok(None)
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = gui_token;
+            Ok(None)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_wrapper(path: &std::path::Path, body: &str) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, body).with_context(|| format!("write wrapper {}", path.display()))?;
+        let perms = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(path, perms)
+            .with_context(|| format!("chmod wrapper {}", path.display()))?;
+        Ok(())
+    }
 }
 
 // ── Windows ConPTY ────────────────────────────────────────────────────────
@@ -295,16 +446,13 @@ mod windows {
         Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{ReadFile, WriteFile},
         System::{
-            Console::{
-                ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
-            },
+            Console::{ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON},
             Pipes::CreatePipe,
             Threading::{
                 CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-                InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
-                WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-                PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES,
-                STARTUPINFOEXW,
+                InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
+                EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
             },
         },
     };
@@ -404,7 +552,13 @@ mod windows {
             loop {
                 let mut read = 0u32;
                 let ok = unsafe {
-                    ReadFile(out_handle, buf.as_mut_ptr().cast(), buf.len() as u32, &mut read, std::ptr::null_mut())
+                    ReadFile(
+                        out_handle,
+                        buf.as_mut_ptr().cast(),
+                        buf.len() as u32,
+                        &mut read,
+                        std::ptr::null_mut(),
+                    )
                 };
                 if ok == 0 || read == 0 {
                     break;
@@ -421,7 +575,13 @@ mod windows {
             while let Some(data) = net_rx.blocking_recv() {
                 let mut written = 0u32;
                 unsafe {
-                    WriteFile(in_handle, data.as_ptr().cast(), data.len() as u32, &mut written, std::ptr::null_mut());
+                    WriteFile(
+                        in_handle,
+                        data.as_ptr().cast(),
+                        data.len() as u32,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    );
                 }
             }
             unsafe { CloseHandle(in_handle) };
@@ -495,19 +655,12 @@ mod windows {
         let mut attr_list_size: usize = 0;
         // First call to get required size
         unsafe {
-            InitializeProcThreadAttributeList(
-                std::ptr::null_mut(),
-                1,
-                0,
-                &mut attr_list_size,
-            );
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_list_size);
         }
         let mut attr_list_buf = vec![0u8; attr_list_size];
         let attr_list = attr_list_buf.as_mut_ptr() as _;
 
-        let ok = unsafe {
-            InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_list_size)
-        };
+        let ok = unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_list_size) };
         if ok == 0 {
             bail!("InitializeProcThreadAttributeList failed");
         }

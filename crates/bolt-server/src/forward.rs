@@ -73,7 +73,9 @@ pub async fn handle_forward(
 fn parse_host_port(s: &str) -> anyhow::Result<(String, u16)> {
     // Handle IPv6: [::1]:80
     if let Some(rest) = s.strip_prefix('[') {
-        let end = rest.find(']').context("invalid IPv6 address in forward target")?;
+        let end = rest
+            .find(']')
+            .context("invalid IPv6 address in forward target")?;
         let host = rest[..end].to_owned();
         let port_str = rest[end + 1..].trim_start_matches(':');
         let port: u16 = port_str.parse().context("invalid port")?;
