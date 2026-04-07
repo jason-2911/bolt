@@ -62,6 +62,10 @@ struct Args {
     #[arg(long)]
     max_per_ip: Option<usize>,
 
+    /// Path to trusted CA public keys file (one base64 key per line)
+    #[arg(long = "ca-keys")]
+    ca_keys: Option<PathBuf>,
+
     /// Log format: "text" or "json"
     #[arg(long = "log-format")]
     log_format: Option<String>,
@@ -83,6 +87,7 @@ struct FileConfig {
     host_key: Option<String>,
     cert: Option<String>,
     authorized_keys: Option<String>,
+    ca_keys: Option<String>,
     log_format: Option<String>,
 }
 
@@ -162,6 +167,9 @@ async fn main() -> anyhow::Result<()> {
         max_per_ip: args.max_per_ip
             .or(file_cfg.max_per_ip)
             .unwrap_or(10),
+
+        ca_keys_path: args.ca_keys
+            .or_else(|| file_cfg.ca_keys.map(PathBuf::from)),
 
         rate_limit_window_secs: file_cfg.rate_limit_window_secs.unwrap_or(60),
         rate_limit_burst: file_cfg.rate_limit_burst.unwrap_or(20),
