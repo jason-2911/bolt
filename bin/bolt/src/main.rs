@@ -39,7 +39,7 @@ use bolt_client::{
     exec::exec,
     forward::{run_local_forward, LocalForward},
     fs::{fs_chmod, fs_ls, fs_mkdir, fs_remove, fs_rename, fs_stat},
-    gui_stream::{run_gui_client, GuiClientConfig},
+    gui::{run_gui_client, GuiClientConfig},
     remote_forward::{run_remote_forward, RemoteForward},
     shell::shell,
     transfer::{download_opts, upload_opts},

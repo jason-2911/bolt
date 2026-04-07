@@ -4,7 +4,7 @@ pub mod agent;
 pub mod exec;
 pub mod forward;
 pub mod fs;
-pub mod gui_stream;
+pub mod gui;
 pub mod handler;
 pub mod ratelimit;
 pub mod remote_forward;

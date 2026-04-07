@@ -24,7 +24,7 @@ use tracing::info;
 
 use bolt_log::{init as log_init, parse_format, Config as LogConfig};
 use bolt_server::{
-    gui_stream::{run_gui_server, GuiServerConfig},
+    gui::{run_gui_server, GuiServerConfig},
     Server, ServerConfig,
 };
 

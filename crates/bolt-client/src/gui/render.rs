@@ -1,3 +1,5 @@
+//! minifb window rendering, framebuffer management, and user input forwarding.
+
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -11,93 +13,273 @@ use minifb::{
     Key, KeyRepeat, MouseButton as FbMouseButton, MouseMode, Scale, Window, WindowOptions,
 };
 use tokio::net::UdpSocket;
-use tracing::{info, warn};
-
-use crate::bitmap_text::BitmapText;
+use tracing::info;
 
 use bolt_proto::{
-    decode_udp_packet, encode_udp_packet, DesktopInventoryChunk, DesktopWindow, InputEvent,
-    MouseButton, Rect, UdpGuiPacket, VideoChunk, VideoCodec, MAX_UDP_PACKET_SIZE,
+    encode_udp_packet, DesktopInventoryChunk, DesktopWindow, InputEvent, MouseButton, Rect,
+    UdpGuiPacket, VideoChunk, VideoCodec,
 };
+
+use super::bitmap_text::BitmapText;
 
 const FRAMEBUFFER_CHANNELS: usize = 3;
 const INVENTORY_WIDTH: usize = 960;
 const INVENTORY_HEIGHT: usize = 540;
 
-pub struct GuiClientConfig {
-    pub listen_addr: String,
-    pub server_addr: String,
-    pub token: String,
+// ── Public render state ───────────────────────────────────────────────────────
+
+pub struct RenderState {
+    pub(super) surface_w: u32,
+    pub(super) surface_h: u32,
+    pub(super) fb: Vec<u8>,
+    partials: HashMap<(u64, u32), PartialPatch>,
+    inventory_partials: HashMap<u64, PartialInventory>,
+    pub(super) inventory: Vec<DesktopWindow>,
+    inventory_generation: u64,
+    pub(super) selected_index: usize,
+    pub(super) attached_window_id: Option<u64>,
+    last_log: Instant,
+    last_inventory_log: Instant,
+    frames_rendered: u64,
+    pub(super) last_window_w: u32,
+    pub(super) last_window_h: u32,
 }
 
-pub async fn run_gui_client(cfg: GuiClientConfig) -> anyhow::Result<()> {
-    let socket = Arc::new(
-        UdpSocket::bind(&cfg.listen_addr)
-            .await
-            .with_context(|| format!("bind UDP {}", cfg.listen_addr))?,
-    );
-    let server: SocketAddr = cfg
-        .server_addr
-        .parse()
-        .with_context(|| format!("parse server addr: {}", cfg.server_addr))?;
-
-    info!(
-        listen = %cfg.listen_addr,
-        server = %cfg.server_addr,
-        "GUI UDP client started"
-    );
-
-    let hello = encode_udp_packet(&UdpGuiPacket::Hello {
-        token: cfg.token.clone(),
-    })?;
-    socket
-        .send_to(&hello, server)
-        .await
-        .context("send GUI hello")?;
-
-    let state = Arc::new(Mutex::new(RenderState::new()));
-
-    let recv_socket = Arc::clone(&socket);
-    let recv_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        if let Err(e) = receive_udp_loop(recv_socket, recv_state).await {
-            warn!(error = %e, "GUI UDP receive loop stopped");
+impl RenderState {
+    pub fn new() -> Self {
+        Self {
+            surface_w: 0,
+            surface_h: 0,
+            fb: Vec::new(),
+            partials: HashMap::new(),
+            inventory_partials: HashMap::new(),
+            inventory: Vec::new(),
+            inventory_generation: 0,
+            selected_index: 0,
+            attached_window_id: None,
+            last_log: Instant::now(),
+            last_inventory_log: Instant::now() - Duration::from_secs(10),
+            frames_rendered: 0,
+            last_window_w: 0,
+            last_window_h: 0,
         }
-    });
+    }
 
-    run_window_loop(state, Arc::clone(&socket), server, cfg.token)?;
-    Ok(())
-}
+    pub fn on_chunk(&mut self, chunk: VideoChunk) -> anyhow::Result<Option<DecodedPatch>> {
+        if !matches!(chunk.codec, VideoCodec::RawRgb24Zstd) {
+            return Err(anyhow!("unsupported video codec"));
+        }
 
-async fn receive_udp_loop(
-    socket: Arc<UdpSocket>,
-    state: Arc<Mutex<RenderState>>,
-) -> anyhow::Result<()> {
-    let mut buf = vec![0_u8; MAX_UDP_PACKET_SIZE];
-    loop {
-        let (n, _peer) = socket
-            .recv_from(&mut buf)
-            .await
-            .context("recv video packet")?;
-        let mut guard = state.lock().map_err(|_| anyhow!("render state poisoned"))?;
-        match decode_udp_packet(&buf[..n])? {
-            UdpGuiPacket::VideoChunk(chunk) => {
-                if let Some(decoded) = guard.on_chunk(chunk)? {
-                    guard.render_patch(decoded)?;
-                }
+        let key = (chunk.frame_id, chunk.patch_id);
+        let slot = self
+            .partials
+            .entry(key)
+            .or_insert_with(|| PartialPatch::new(&chunk));
+        slot.insert(chunk)?;
+
+        if !slot.complete() {
+            return Ok(None);
+        }
+        let rect = slot.rect;
+        let surface_w = slot.surface_w;
+        let surface_h = slot.surface_h;
+        let full = slot.reassemble()?;
+        self.partials.remove(&key);
+
+        let patch_rgb = zstd::stream::decode_all(full.as_slice()).context("zstd decode")?;
+        Ok(Some(DecodedPatch {
+            frame_id: key.0,
+            rect,
+            surface_w,
+            surface_h,
+            rgb: patch_rgb,
+        }))
+    }
+
+    pub fn on_inventory_chunk(&mut self, chunk: DesktopInventoryChunk) -> anyhow::Result<()> {
+        let generation = chunk.generation;
+        let slot = self
+            .inventory_partials
+            .entry(generation)
+            .or_insert_with(|| PartialInventory::new(&chunk));
+        slot.insert(chunk)?;
+        if !slot.complete() {
+            return Ok(());
+        }
+
+        let Some(assembled) = self
+            .inventory_partials
+            .remove(&generation)
+            .map(PartialInventory::reassemble)
+        else {
+            return Ok(());
+        };
+        self.inventory_partials
+            .retain(|remaining_generation, _| *remaining_generation > assembled.generation);
+        self.apply_inventory(assembled);
+        Ok(())
+    }
+
+    fn apply_inventory(&mut self, assembled: CompletedInventory) {
+        let previous_selected = self.selected_window_id();
+        self.inventory_generation = assembled.generation;
+        self.inventory = assembled.windows;
+        self.attached_window_id = assembled.attached_window_id;
+
+        if let Some(attached) = self.attached_window_id {
+            if let Some(index) = self
+                .inventory
+                .iter()
+                .position(|window| window.window_id == attached)
+            {
+                self.selected_index = index;
             }
-            UdpGuiPacket::DesktopInventoryChunk(chunk) => {
-                guard.on_inventory_chunk(chunk)?;
+        } else if let Some(previous_selected) = previous_selected {
+            if let Some(index) = self
+                .inventory
+                .iter()
+                .position(|window| window.window_id == previous_selected)
+            {
+                self.selected_index = index;
+            } else if self.selected_index >= self.inventory.len() {
+                self.selected_index = self.inventory.len().saturating_sub(1);
             }
-            UdpGuiPacket::Hello { .. }
-            | UdpGuiPacket::AttachWindow { .. }
-            | UdpGuiPacket::DetachWindow
-            | UdpGuiPacket::InputEvent(_) => {}
+        } else if self.selected_index >= self.inventory.len() {
+            self.selected_index = self.inventory.len().saturating_sub(1);
+        }
+
+        if self.last_inventory_log.elapsed() >= Duration::from_secs(1) {
+            info!(
+                generation = self.inventory_generation,
+                windows = self.inventory.len(),
+                attached = ?self.attached_window_id,
+                selected = self.selected_window_id(),
+                "received desktop inventory"
+            );
+            self.last_inventory_log = Instant::now();
+        }
+    }
+
+    pub fn render_patch(&mut self, patch: DecodedPatch) -> anyhow::Result<()> {
+        self.ensure_surface(patch.surface_w, patch.surface_h);
+
+        blit_patch(
+            &mut self.fb,
+            self.surface_w,
+            self.surface_h,
+            patch.rect,
+            &patch.rgb,
+        )?;
+
+        self.frames_rendered = self.frames_rendered.wrapping_add(1);
+        if self.last_log.elapsed() >= Duration::from_secs(1) {
+            let checksum = checksum32(&self.fb);
+            info!(
+                frame_id = patch.frame_id,
+                rendered = self.frames_rendered,
+                surface = format!("{}x{}", self.surface_w, self.surface_h),
+                dirty = format!(
+                    "{}x{}+{},{}",
+                    patch.rect.w, patch.rect.h, patch.rect.x, patch.rect.y
+                ),
+                window = format!("{}x{}", self.last_window_w, self.last_window_h),
+                checksum,
+                "rendered local window patch"
+            );
+            self.last_log = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn ensure_surface(&mut self, w: u32, h: u32) {
+        if self.surface_w == w && self.surface_h == h {
+            return;
+        }
+        self.surface_w = w;
+        self.surface_h = h;
+        self.fb = vec![0_u8; (w as usize) * (h as usize) * FRAMEBUFFER_CHANNELS];
+    }
+
+    pub fn selected_window_id(&self) -> Option<u64> {
+        self.inventory
+            .get(self.selected_index)
+            .map(|window| window.window_id)
+    }
+
+    pub fn move_selection(&mut self, delta: isize) {
+        if self.inventory.is_empty() {
+            self.selected_index = 0;
+            return;
+        }
+        let len = self.inventory.len() as isize;
+        let next = (self.selected_index as isize + delta).clamp(0, len - 1);
+        self.selected_index = next as usize;
+    }
+
+    pub fn select_index(&mut self, index: usize) {
+        self.selected_index = index.min(self.inventory.len().saturating_sub(1));
+    }
+
+    pub fn select_last(&mut self) {
+        self.selected_index = self.inventory.len().saturating_sub(1);
+    }
+
+    pub fn cycle_selection(&mut self, delta: isize) -> Option<u64> {
+        if self.inventory.is_empty() {
+            return None;
+        }
+        let len = self.inventory.len() as isize;
+        let current = self
+            .inventory
+            .iter()
+            .position(|window| Some(window.window_id) == self.attached_window_id)
+            .unwrap_or(self.selected_index) as isize;
+        let mut next = current + delta;
+        if next < 0 {
+            next = len - 1;
+        } else if next >= len {
+            next = 0;
+        }
+        self.selected_index = next as usize;
+        self.inventory
+            .get(self.selected_index)
+            .map(|window| window.window_id)
+    }
+
+    pub fn selector_window_title(&self) -> String {
+        let selected = self.inventory.get(self.selected_index);
+        match selected {
+            Some(window) => format!(
+                "Bolt Desktop Agent [{} / {}] {} - {}",
+                self.selected_index + 1,
+                self.inventory.len(),
+                window.process_name,
+                truncate_text(&window.title, 64)
+            ),
+            None => "Bolt Desktop Agent - Waiting For Windows".to_string(),
+        }
+    }
+
+    pub fn attached_window_title(&self) -> String {
+        let attached = self.attached_window_id.and_then(|attached| {
+            self.inventory
+                .iter()
+                .find(|window| window.window_id == attached)
+        });
+        match attached {
+            Some(window) => format!(
+                "Bolt GUI Stream - {} - {}",
+                window.process_name,
+                truncate_text(&window.title, 64)
+            ),
+            None => "Bolt GUI Stream".to_string(),
         }
     }
 }
 
-fn run_window_loop(
+// ── Window loop ───────────────────────────────────────────────────────────────
+
+pub fn run_window_loop(
     state: Arc<Mutex<RenderState>>,
     socket: Arc<UdpSocket>,
     server: SocketAddr,
@@ -172,7 +354,6 @@ fn run_window_loop(
                 window.set_title(&guard.selector_window_title());
             }
 
-            // Keep local pointer state in sync for relative interactions.
             guard.last_window_w = window.get_size().0 as u32;
             guard.last_window_h = window.get_size().1 as u32;
         }
@@ -286,7 +467,10 @@ fn run_window_loop(
     Ok(())
 }
 
+// ── Input helpers ─────────────────────────────────────────────────────────────
+
 fn send_input_event(socket: &Arc<UdpSocket>, server: SocketAddr, packet: UdpGuiPacket) {
+    use tracing::warn;
     let wire = match encode_udp_packet(&packet) {
         Ok(w) => w,
         Err(e) => {
@@ -296,16 +480,6 @@ fn send_input_event(socket: &Arc<UdpSocket>, server: SocketAddr, packet: UdpGuiP
     };
     if let Err(e) = socket.try_send_to(&wire, server) {
         warn!(error = %e, "send input event failed");
-    }
-}
-
-fn rgb_to_u32(rgb: &[u8], out: &mut [u32]) {
-    for (i, px) in out.iter_mut().enumerate() {
-        let idx = i * 3;
-        let r = rgb[idx] as u32;
-        let g = rgb[idx + 1] as u32;
-        let b = rgb[idx + 2] as u32;
-        *px = (r << 16) | (g << 8) | b;
     }
 }
 
@@ -393,311 +567,7 @@ fn handle_selector_shortcuts(
     Ok(())
 }
 
-struct RenderState {
-    surface_w: u32,
-    surface_h: u32,
-    fb: Vec<u8>,
-    partials: HashMap<(u64, u32), PartialPatch>,
-    inventory_partials: HashMap<u64, PartialInventory>,
-    inventory: Vec<DesktopWindow>,
-    inventory_generation: u64,
-    selected_index: usize,
-    attached_window_id: Option<u64>,
-    last_log: Instant,
-    last_inventory_log: Instant,
-    frames_rendered: u64,
-    last_window_w: u32,
-    last_window_h: u32,
-}
-
-impl RenderState {
-    fn new() -> Self {
-        Self {
-            surface_w: 0,
-            surface_h: 0,
-            fb: Vec::new(),
-            partials: HashMap::new(),
-            inventory_partials: HashMap::new(),
-            inventory: Vec::new(),
-            inventory_generation: 0,
-            selected_index: 0,
-            attached_window_id: None,
-            last_log: Instant::now(),
-            last_inventory_log: Instant::now() - Duration::from_secs(10),
-            frames_rendered: 0,
-            last_window_w: 0,
-            last_window_h: 0,
-        }
-    }
-
-    fn on_chunk(&mut self, chunk: VideoChunk) -> anyhow::Result<Option<DecodedPatch>> {
-        if !matches!(chunk.codec, VideoCodec::RawRgb24Zstd) {
-            return Err(anyhow!("unsupported video codec"));
-        }
-
-        let key = (chunk.frame_id, chunk.patch_id);
-        let slot = self
-            .partials
-            .entry(key)
-            .or_insert_with(|| PartialPatch::new(&chunk));
-        slot.insert(chunk)?;
-
-        if !slot.complete() {
-            return Ok(None);
-        }
-        let rect = slot.rect;
-        let surface_w = slot.surface_w;
-        let surface_h = slot.surface_h;
-        let full = slot.reassemble()?;
-        self.partials.remove(&key);
-
-        let patch_rgb = zstd::stream::decode_all(full.as_slice()).context("zstd decode")?;
-        Ok(Some(DecodedPatch {
-            frame_id: key.0,
-            rect,
-            surface_w,
-            surface_h,
-            rgb: patch_rgb,
-        }))
-    }
-
-    fn on_inventory_chunk(&mut self, chunk: DesktopInventoryChunk) -> anyhow::Result<()> {
-        let generation = chunk.generation;
-        let slot = self
-            .inventory_partials
-            .entry(generation)
-            .or_insert_with(|| PartialInventory::new(&chunk));
-        slot.insert(chunk)?;
-        if !slot.complete() {
-            return Ok(());
-        }
-
-        let Some(assembled) = self
-            .inventory_partials
-            .remove(&generation)
-            .map(PartialInventory::reassemble)
-        else {
-            return Ok(());
-        };
-        self.inventory_partials
-            .retain(|remaining_generation, _| *remaining_generation > assembled.generation);
-        self.apply_inventory(assembled);
-        Ok(())
-    }
-
-    fn apply_inventory(&mut self, assembled: CompletedInventory) {
-        let previous_selected = self.selected_window_id();
-        self.inventory_generation = assembled.generation;
-        self.inventory = assembled.windows;
-        self.attached_window_id = assembled.attached_window_id;
-
-        if let Some(attached) = self.attached_window_id {
-            if let Some(index) = self
-                .inventory
-                .iter()
-                .position(|window| window.window_id == attached)
-            {
-                self.selected_index = index;
-            }
-        } else if let Some(previous_selected) = previous_selected {
-            if let Some(index) = self
-                .inventory
-                .iter()
-                .position(|window| window.window_id == previous_selected)
-            {
-                self.selected_index = index;
-            } else if self.selected_index >= self.inventory.len() {
-                self.selected_index = self.inventory.len().saturating_sub(1);
-            }
-        } else if self.selected_index >= self.inventory.len() {
-            self.selected_index = self.inventory.len().saturating_sub(1);
-        }
-
-        if self.last_inventory_log.elapsed() >= Duration::from_secs(1) {
-            info!(
-                generation = self.inventory_generation,
-                windows = self.inventory.len(),
-                attached = ?self.attached_window_id,
-                selected = self.selected_window_id(),
-                "received desktop inventory"
-            );
-            self.last_inventory_log = Instant::now();
-        }
-    }
-
-    fn render_patch(&mut self, patch: DecodedPatch) -> anyhow::Result<()> {
-        self.ensure_surface(patch.surface_w, patch.surface_h);
-
-        blit_patch(
-            &mut self.fb,
-            self.surface_w,
-            self.surface_h,
-            patch.rect,
-            &patch.rgb,
-        )?;
-
-        self.frames_rendered = self.frames_rendered.wrapping_add(1);
-        if self.last_log.elapsed() >= Duration::from_secs(1) {
-            let checksum = checksum32(&self.fb);
-            info!(
-                frame_id = patch.frame_id,
-                rendered = self.frames_rendered,
-                surface = format!("{}x{}", self.surface_w, self.surface_h),
-                dirty = format!(
-                    "{}x{}+{},{}",
-                    patch.rect.w, patch.rect.h, patch.rect.x, patch.rect.y
-                ),
-                window = format!("{}x{}", self.last_window_w, self.last_window_h),
-                checksum,
-                "rendered local window patch"
-            );
-            self.last_log = Instant::now();
-        }
-        Ok(())
-    }
-
-    fn ensure_surface(&mut self, w: u32, h: u32) {
-        if self.surface_w == w && self.surface_h == h {
-            return;
-        }
-        self.surface_w = w;
-        self.surface_h = h;
-        self.fb = vec![0_u8; (w as usize) * (h as usize) * FRAMEBUFFER_CHANNELS];
-    }
-
-    fn selected_window_id(&self) -> Option<u64> {
-        self.inventory
-            .get(self.selected_index)
-            .map(|window| window.window_id)
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        if self.inventory.is_empty() {
-            self.selected_index = 0;
-            return;
-        }
-
-        let len = self.inventory.len() as isize;
-        let next = (self.selected_index as isize + delta).clamp(0, len - 1);
-        self.selected_index = next as usize;
-    }
-
-    fn select_index(&mut self, index: usize) {
-        self.selected_index = index.min(self.inventory.len().saturating_sub(1));
-    }
-
-    fn select_last(&mut self) {
-        self.selected_index = self.inventory.len().saturating_sub(1);
-    }
-
-    fn cycle_selection(&mut self, delta: isize) -> Option<u64> {
-        if self.inventory.is_empty() {
-            return None;
-        }
-        let len = self.inventory.len() as isize;
-        let current = self
-            .inventory
-            .iter()
-            .position(|window| Some(window.window_id) == self.attached_window_id)
-            .unwrap_or(self.selected_index) as isize;
-        let mut next = current + delta;
-        if next < 0 {
-            next = len - 1;
-        } else if next >= len {
-            next = 0;
-        }
-        self.selected_index = next as usize;
-        self.inventory
-            .get(self.selected_index)
-            .map(|window| window.window_id)
-    }
-
-    fn selector_window_title(&self) -> String {
-        let selected = self.inventory.get(self.selected_index);
-        match selected {
-            Some(window) => format!(
-                "Bolt Desktop Agent [{} / {}] {} - {}",
-                self.selected_index + 1,
-                self.inventory.len(),
-                window.process_name,
-                truncate_text(&window.title, 64)
-            ),
-            None => "Bolt Desktop Agent - Waiting For Windows".to_string(),
-        }
-    }
-
-    fn attached_window_title(&self) -> String {
-        let attached = self.attached_window_id.and_then(|attached| {
-            self.inventory
-                .iter()
-                .find(|window| window.window_id == attached)
-        });
-        match attached {
-            Some(window) => format!(
-                "Bolt GUI Stream - {} - {}",
-                window.process_name,
-                truncate_text(&window.title, 64)
-            ),
-            None => "Bolt GUI Stream".to_string(),
-        }
-    }
-}
-
-struct PartialInventory {
-    generation: u64,
-    total: u16,
-    attached_window_id: Option<u64>,
-    chunks: Vec<Option<Vec<DesktopWindow>>>,
-}
-
-impl PartialInventory {
-    fn new(chunk: &DesktopInventoryChunk) -> Self {
-        Self {
-            generation: chunk.generation,
-            total: chunk.chunk_total,
-            attached_window_id: chunk.attached_window_id,
-            chunks: vec![None; chunk.chunk_total as usize],
-        }
-    }
-
-    fn insert(&mut self, chunk: DesktopInventoryChunk) -> anyhow::Result<()> {
-        if chunk.generation != self.generation {
-            return Err(anyhow!("inventory generation mismatch"));
-        }
-        if chunk.chunk_total != self.total {
-            return Err(anyhow!("inventory total mismatch"));
-        }
-        let index = chunk.chunk_index as usize;
-        if index >= self.chunks.len() {
-            return Err(anyhow!("inventory chunk index out of bounds"));
-        }
-        self.attached_window_id = chunk.attached_window_id;
-        self.chunks[index] = Some(chunk.windows);
-        Ok(())
-    }
-
-    fn complete(&self) -> bool {
-        self.chunks.iter().all(|chunk| chunk.is_some())
-    }
-
-    fn reassemble(self) -> CompletedInventory {
-        let mut windows = Vec::new();
-        for chunk in self.chunks.into_iter().flatten() {
-            windows.extend(chunk);
-        }
-        CompletedInventory {
-            generation: self.generation,
-            attached_window_id: self.attached_window_id,
-            windows,
-        }
-    }
-}
-
-struct CompletedInventory {
-    generation: u64,
-    attached_window_id: Option<u64>,
-    windows: Vec<DesktopWindow>,
-}
+// ── Inventory rendering ───────────────────────────────────────────────────────
 
 fn render_inventory_screen(
     screen: &mut [u32],
@@ -708,15 +578,7 @@ fn render_inventory_screen(
 ) {
     clear_u32(screen, 0x10161d);
     fill_rect(screen, width, height, 0, 0, width, 72, 0x172333);
-    draw_text_with_shadow(
-        screen,
-        width,
-        height,
-        text,
-        (20, 14),
-        "Bolt Desktop Agent",
-        0xf6f8fb,
-    );
+    draw_text_with_shadow(screen, width, height, text, (20, 14), "Bolt Desktop Agent", 0xf6f8fb);
     draw_text_with_shadow(
         screen,
         width,
@@ -727,26 +589,14 @@ fn render_inventory_screen(
         0x9fb3c8,
     );
 
-    let status = if state.attached_window_id.is_some() {
-        "Attached"
-    } else {
-        "Browsing"
-    };
+    let status = if state.attached_window_id.is_some() { "Attached" } else { "Browsing" };
     let inventory_label = format!(
         "{} windows={} generation={}",
         status,
         state.inventory.len(),
         state.inventory_generation
     );
-    draw_text_with_shadow(
-        screen,
-        width,
-        height,
-        text,
-        (20, 54),
-        &inventory_label,
-        0x7ad7a8,
-    );
+    draw_text_with_shadow(screen, width, height, text, (20, 54), &inventory_label, 0x7ad7a8);
 
     if state.inventory.is_empty() {
         draw_text_with_shadow(
@@ -807,13 +657,7 @@ fn render_inventory_screen(
             background,
         );
 
-        let prefix = if is_attached {
-            "*"
-        } else if is_selected {
-            ">"
-        } else {
-            " "
-        };
+        let prefix = if is_attached { "*" } else if is_selected { ">" } else { " " };
         let pid = window
             .pid
             .map(|pid| pid.to_string())
@@ -832,21 +676,7 @@ fn render_inventory_screen(
     }
 }
 
-fn truncate_text(text: &str, limit: usize) -> String {
-    let mut out = String::new();
-    for (idx, ch) in text.chars().enumerate() {
-        if idx >= limit {
-            out.push_str("...");
-            break;
-        }
-        out.push(if ch.is_control() { ' ' } else { ch });
-    }
-    if out.is_empty() {
-        "-".to_string()
-    } else {
-        out
-    }
-}
+// ── Drawing primitives ────────────────────────────────────────────────────────
 
 fn clear_u32(screen: &mut [u32], color: u32) {
     screen.fill(color);
@@ -890,6 +720,44 @@ fn draw_text_with_shadow(
         0x000000,
     );
     text.draw(screen, width, height, pos, value, color);
+}
+
+fn rgb_to_u32(rgb: &[u8], out: &mut [u32]) {
+    for (i, px) in out.iter_mut().enumerate() {
+        let idx = i * 3;
+        let r = rgb[idx] as u32;
+        let g = rgb[idx + 1] as u32;
+        let b = rgb[idx + 2] as u32;
+        *px = (r << 16) | (g << 8) | b;
+    }
+}
+
+fn truncate_text(text: &str, limit: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= limit {
+            out.push_str("...");
+            break;
+        }
+        out.push(if ch.is_control() { ' ' } else { ch });
+    }
+    if out.is_empty() { "-".to_string() } else { out }
+}
+
+fn checksum32(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .fold(0_u32, |acc, b| acc.rotate_left(5) ^ (*b as u32))
+}
+
+// ── Patch reassembly ──────────────────────────────────────────────────────────
+
+pub struct DecodedPatch {
+    pub frame_id: u64,
+    pub rect: Rect,
+    pub surface_w: u32,
+    pub surface_h: u32,
+    pub rgb: Vec<u8>,
 }
 
 struct PartialPatch {
@@ -939,13 +807,65 @@ impl PartialPatch {
     }
 }
 
-struct DecodedPatch {
-    frame_id: u64,
-    rect: Rect,
-    surface_w: u32,
-    surface_h: u32,
-    rgb: Vec<u8>,
+// ── Inventory reassembly ──────────────────────────────────────────────────────
+
+struct PartialInventory {
+    generation: u64,
+    total: u16,
+    attached_window_id: Option<u64>,
+    chunks: Vec<Option<Vec<DesktopWindow>>>,
 }
+
+impl PartialInventory {
+    fn new(chunk: &DesktopInventoryChunk) -> Self {
+        Self {
+            generation: chunk.generation,
+            total: chunk.chunk_total,
+            attached_window_id: chunk.attached_window_id,
+            chunks: vec![None; chunk.chunk_total as usize],
+        }
+    }
+
+    fn insert(&mut self, chunk: DesktopInventoryChunk) -> anyhow::Result<()> {
+        if chunk.generation != self.generation {
+            return Err(anyhow!("inventory generation mismatch"));
+        }
+        if chunk.chunk_total != self.total {
+            return Err(anyhow!("inventory total mismatch"));
+        }
+        let index = chunk.chunk_index as usize;
+        if index >= self.chunks.len() {
+            return Err(anyhow!("inventory chunk index out of bounds"));
+        }
+        self.attached_window_id = chunk.attached_window_id;
+        self.chunks[index] = Some(chunk.windows);
+        Ok(())
+    }
+
+    fn complete(&self) -> bool {
+        self.chunks.iter().all(|chunk| chunk.is_some())
+    }
+
+    fn reassemble(self) -> CompletedInventory {
+        let mut windows = Vec::new();
+        for chunk in self.chunks.into_iter().flatten() {
+            windows.extend(chunk);
+        }
+        CompletedInventory {
+            generation: self.generation,
+            attached_window_id: self.attached_window_id,
+            windows,
+        }
+    }
+}
+
+struct CompletedInventory {
+    generation: u64,
+    attached_window_id: Option<u64>,
+    windows: Vec<DesktopWindow>,
+}
+
+// ── Framebuffer ops ───────────────────────────────────────────────────────────
 
 fn blit_patch(
     fb: &mut [u8],
@@ -977,10 +897,4 @@ fn blit_patch(
         fb[dst_off..dst_off + len].copy_from_slice(&rgb[src_off..src_off + len]);
     }
     Ok(())
-}
-
-fn checksum32(bytes: &[u8]) -> u32 {
-    bytes
-        .iter()
-        .fold(0_u32, |acc, b| acc.rotate_left(5) ^ (*b as u32))
 }
