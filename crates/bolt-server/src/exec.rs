@@ -1,35 +1,78 @@
-//! Server-side exec channel: run a command and relay stdout/exit code.
+//! Server-side exec channel: run a command as the authenticated user.
+
+use std::ffi::CString;
 
 use anyhow::Context as _;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
-};
-use tracing::error;
+use nix::libc;
+use tokio::process::Command;
 
-use bolt_proto::channel::{ExitStatusMsg, MsgType};
-use bolt_session::Stream;
+use bolt_proto::{write_msg, Message};
 
-pub async fn handle_exec_channel(stream: &mut Stream, command: &str) -> anyhow::Result<()> {
-    let output = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .output()
-        .await
-        .context("exec command")?;
+pub async fn handle_exec(
+    send: &mut quinn::SendStream,
+    _recv: &mut quinn::RecvStream,
+    command: &str,
+    user: &str,
+) -> anyhow::Result<()> {
+    let (shell, home, uid, gid) = resolve_user(user)?;
 
-    // Relay stdout
+    let output = unsafe {
+        Command::new(&shell)
+            .arg("-c")
+            .arg(command)
+            .env_clear()
+            .env("HOME", &home)
+            .env("USER", user)
+            .env("LOGNAME", user)
+            .env("SHELL", &shell)
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("LANG", std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()))
+            .current_dir(&home)
+            .pre_exec(move || {
+                libc::setgid(gid);
+                libc::setuid(uid);
+                Ok(())
+            })
+            .output()
+            .await
+            .context("exec command")?
+    };
+
     if !output.stdout.is_empty() {
-        // Prefix with MsgChannelData
-        let mut msg = vec![MsgType::ChannelData as u8];
-        msg.extend_from_slice(&(output.stdout.len() as u32).to_be_bytes());
-        msg.extend_from_slice(&output.stdout);
-        stream.write_all(&msg).await?;
+        write_msg(send, &Message::Data(output.stdout)).await?;
     }
 
-    // Send exit status
-    let code = output.status.code().unwrap_or(1) as u32;
-    stream.write_all(&ExitStatusMsg { exit_code: code }.marshal()).await?;
+    if !output.stderr.is_empty() {
+        write_msg(send, &Message::Data(output.stderr)).await?;
+    }
+
+    let code = output.status.code().unwrap_or(1);
+    write_msg(send, &Message::ExitStatus { code }).await?;
 
     Ok(())
+}
+
+fn resolve_user(user: &str) -> anyhow::Result<(String, String, u32, u32)> {
+    let c_user = CString::new(user).context("invalid username")?;
+    let pw = unsafe { libc::getpwnam(c_user.as_ptr()) };
+
+    if pw.is_null() {
+        anyhow::bail!("unknown user: {user}");
+    }
+
+    let pw = unsafe { &*pw };
+    let shell = unsafe { std::ffi::CStr::from_ptr(pw.pw_shell) }
+        .to_string_lossy()
+        .into_owned();
+    let home = unsafe { std::ffi::CStr::from_ptr(pw.pw_dir) }
+        .to_string_lossy()
+        .into_owned();
+
+    let shell = if shell.is_empty() {
+        "/bin/sh".to_owned()
+    } else {
+        shell
+    };
+
+    Ok((shell, home, pw.pw_uid, pw.pw_gid))
 }
